@@ -1,12 +1,23 @@
 package eventbus
 
 import (
+	"bytes"
 	"context"
+	"errors"
+	"fmt"
 
-	"log"
+	"os"
+	"runtime"
+	"strconv"
+
 	"sync"
 
 	"github.com/streadway/amqp"
+)
+
+var (
+	// ErrRabbitMQChannelNotFound ...
+	ErrRabbitMQChannelNotFound = errors.New("rabbitmq channel not found")
 )
 
 var (
@@ -15,6 +26,7 @@ var (
 		ExchangeName: "nilorg.eventbus",
 		ExchangeType: "topic",
 		Serialize:    &JSONSerialize{},
+		Logger:       &StdLogger{},
 	}
 )
 
@@ -23,6 +35,7 @@ type RabbitMQOptions struct {
 	ExchangeName string
 	ExchangeType string
 	Serialize    Serializer
+	Logger       Logger
 }
 
 type rabbitMQRoutingKey struct{}
@@ -40,23 +53,26 @@ func FromRabbitMQRoutingKeyContext(ctx context.Context) (routingKey string, ok b
 
 // NewRabbitMQ 创建RabbitMQ事件总线
 func NewRabbitMQ(conn *amqp.Connection, options *RabbitMQOptions) (bus EventBus, err error) {
-	var (
-		ch  *amqp.Channel
-		ops RabbitMQOptions
-	)
-	ch, err = conn.Channel()
-	if err != nil {
-		return
-	}
+	var ops RabbitMQOptions
 	if options == nil {
 		ops = DefaultRabbitMQOptions
 	} else {
 		ops = *options
 	}
 	rbus := &rabbitMQEventBus{
-		channel:          ch,
+		conn:             conn,
 		options:          &ops,
 		subscribeCancels: &sync.Map{},
+		channelPool: &sync.Pool{
+			New: func() interface{} {
+				fmt.Println("===================创建")
+				ch, chErr := conn.Channel()
+				if chErr != nil {
+					return nil
+				}
+				return ch
+			},
+		},
 	}
 	err = rbus.exchangeDeclare()
 	if err != nil {
@@ -73,12 +89,45 @@ type subscribeCancel struct {
 
 type rabbitMQEventBus struct {
 	options          *RabbitMQOptions
-	channel          *amqp.Channel
+	conn             *amqp.Connection
 	subscribeCancels *sync.Map
+	channelPool      *sync.Pool
+}
+
+// GetGoroutineID ...
+func GetGoroutineID() uint64 {
+	b := make([]byte, 64)
+	runtime.Stack(b, false)
+	b = bytes.TrimPrefix(b, []byte("goroutine "))
+	b = b[:bytes.IndexByte(b, ' ')]
+	n, _ := strconv.ParseUint(string(b), 10, 64)
+	return n
+}
+func (bus *rabbitMQEventBus) channel() (ch *amqp.Channel, err error) {
+	bus.options.Logger.Debugf(context.Background(), "PID: %d, GoroutineID: %d Channel OK", os.Getpid(), GetGoroutineID())
+	v := bus.channelPool.Get()
+	ok := false
+	if v == nil {
+		ch, err = bus.conn.Channel()
+		if err != nil {
+			return
+		}
+		bus.channelPool.Put(ch)
+		return
+	}
+	if ch, ok = v.(*amqp.Channel); !ok {
+		err = ErrRabbitMQChannelNotFound
+		return
+	}
+	return
 }
 
 func (bus *rabbitMQEventBus) exchangeDeclare() (err error) {
-	err = bus.channel.ExchangeDeclare(
+	var ch *amqp.Channel
+	if ch, err = bus.channel(); err != nil {
+		return
+	}
+	err = ch.ExchangeDeclare(
 		bus.options.ExchangeName, //名称
 		bus.options.ExchangeType, //类型
 		true,                     //持久
@@ -90,8 +139,8 @@ func (bus *rabbitMQEventBus) exchangeDeclare() (err error) {
 	return
 }
 
-func (bus *rabbitMQEventBus) queueDeclare(topic string) (queue amqp.Queue, err error) {
-	queue, err = bus.channel.QueueDeclare(
+func (bus *rabbitMQEventBus) queueDeclare(ch *amqp.Channel, topic string) (queue amqp.Queue, err error) {
+	queue, err = ch.QueueDeclare(
 		topic, // 名称
 		true,  // 持久性
 		false, // 删除未使用时
@@ -103,16 +152,20 @@ func (bus *rabbitMQEventBus) queueDeclare(topic string) (queue amqp.Queue, err e
 }
 
 func (bus *rabbitMQEventBus) Publish(ctx context.Context, topic string, v interface{}) (err error) {
-	return bus.publish(ctx, topic, v, false)
+	return bus.publish(ctx, topic, v, "", false)
 }
 
 func (bus *rabbitMQEventBus) PublishAsync(ctx context.Context, topic, callbackName string, v interface{}) (err error) {
-	return bus.publish(ctx, topic, v, true)
+	return bus.publish(ctx, topic, v, callbackName, true)
 }
 
-func (bus *rabbitMQEventBus) publish(ctx context.Context, topic string, v interface{}, async bool) (err error) {
+func (bus *rabbitMQEventBus) publish(ctx context.Context, topic string, v interface{}, callbackName string, async bool) (err error) {
 	msg := &Message{
-		Value: v,
+		Header: make(MessageHeader),
+		Value:  v,
+	}
+	if async {
+		msg.Header[MessageHeaderCallback] = callbackName
 	}
 	var data []byte
 	data, err = bus.options.Serialize.Marshal(msg)
@@ -123,7 +176,11 @@ func (bus *rabbitMQEventBus) publish(ctx context.Context, topic string, v interf
 	if routingKey, ok := FromRabbitMQRoutingKeyContext(ctx); ok {
 		publishKey = routingKey
 	}
-	err = bus.channel.Publish(
+	var ch *amqp.Channel
+	if ch, err = bus.channel(); err != nil {
+		return
+	}
+	err = ch.Publish(
 		bus.options.ExchangeName, //交换
 		publishKey,               //路由密钥
 		!async,                   //强制
@@ -144,15 +201,19 @@ func (bus *rabbitMQEventBus) SubscribeAsync(ctx context.Context, topic string, h
 }
 
 func (bus *rabbitMQEventBus) subscribe(ctx context.Context, topic string, h SubscribeHandler, async bool) (err error) {
+	var ch *amqp.Channel
+	if ch, err = bus.channel(); err != nil {
+		return
+	}
 	var queue amqp.Queue
 	// 一对多，要生产不同的 queue
-	queue, err = bus.queueDeclare(topic)
+	queue, err = bus.queueDeclare(ch, topic)
 	if err != nil {
 		return
 	}
 	consumeQueueName := ""
 	if routingKey, ok := FromRabbitMQRoutingKeyContext(ctx); ok {
-		err = bus.channel.QueueBind(
+		err = ch.QueueBind(
 			queue.Name,               // 队列
 			routingKey,               // routing key
 			bus.options.ExchangeName, // 交换
@@ -165,7 +226,7 @@ func (bus *rabbitMQEventBus) subscribe(ctx context.Context, topic string, h Subs
 		consumeQueueName = queue.Name
 	}
 	var msgs <-chan amqp.Delivery
-	msgs, err = bus.channel.Consume(
+	msgs, err = ch.Consume(
 		consumeQueueName, // 队列
 		"",               // 消费者
 		false,            // 自动确认
@@ -196,8 +257,9 @@ func (bus *rabbitMQEventBus) subscribe(ctx context.Context, topic string, h Subs
 	}
 	if async {
 		go func() {
-			asyncErr := bus.handleSubMessage(cancelCtx, msgs, h)
-			log.Printf("EventBus async error: %s\n", asyncErr)
+			if asyncErr := bus.handleSubMessage(cancelCtx, msgs, h); asyncErr != nil {
+				bus.options.Logger.Errorf(context.Background(), "async subscribe %s error: %v", topic, asyncErr)
+			}
 		}()
 	} else {
 		err = bus.handleSubMessage(cancelCtx, msgs, h)
@@ -232,13 +294,45 @@ func (bus *rabbitMQEventBus) handleSubMessage(ctx context.Context, msgs <-chan a
 func (bus *rabbitMQEventBus) Unsubscribe(topic string) (err error) {
 	if v, ok := bus.subscribeCancels.Load(topic); ok {
 		sc := v.(*subscribeCancel)
-		if sc != nil && sc.CtxCancel != nil {
-			sc.CtxCancel()
-		}
+		bus.unsubscribe(topic, sc)
+	}
+	return
+}
+
+func (bus *rabbitMQEventBus) unsubscribe(topic string, sc *subscribeCancel) (err error) {
+	bus.options.Logger.Debugf(context.Background(), "unsubscribe %s", topic)
+	if sc != nil && sc.CtxCancel != nil {
+		bus.options.Logger.Debugf(context.Background(), "unsubscribe %s CtxCancel", topic)
+		sc.CtxCancel()
+	}
+	var ch *amqp.Channel
+	if ch, err = bus.channel(); err != nil {
+		return
+	}
+	var queue amqp.Queue
+	queue, err = ch.QueueInspect(topic)
+	if err != nil {
+		return
+	}
+	bus.options.Logger.Debugf(context.Background(), "queue Consumers: %d, Messages: %d", queue.Consumers, queue.Messages)
+	if queue.Consumers == 0 && queue.Messages == 0 {
+		_, err = ch.QueueDelete(topic, true, true, false)
 	}
 	return
 }
 
 func (bus *rabbitMQEventBus) Close() (err error) {
-	return bus.channel.Close()
+	bus.subscribeCancels.Range(func(key interface{}, value interface{}) bool {
+		topic := key.(string)
+		sc := value.(*subscribeCancel)
+		if unErr := bus.unsubscribe(topic, sc); unErr != nil {
+			bus.options.Logger.Errorf(context.Background(), "unsubscribe %s error: %v", topic, unErr)
+		}
+		return true
+	})
+	var ch *amqp.Channel
+	if ch, err = bus.channel(); err != nil {
+		return
+	}
+	return ch.Close()
 }
