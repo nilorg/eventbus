@@ -72,11 +72,6 @@ func TestRabbitMQEventBusSync(t *testing.T) {
 		fmt.Println("Publish sync success")
 		time.Sleep(3 * time.Second)
 	}
-	time.Sleep(3 * time.Second)
-	err = bus.Close()
-	if err != nil {
-		t.Error(err)
-	}
 	time.Sleep(time.Second * 5)
 }
 
@@ -124,11 +119,6 @@ func TestRabbitMQEventBusASync(t *testing.T) {
 		}
 		fmt.Println("Publish async success")
 		time.Sleep(3 * time.Second)
-	}
-	time.Sleep(3 * time.Second)
-	err = bus.Close()
-	if err != nil {
-		t.Error(err)
 	}
 	time.Sleep(time.Second * 5)
 }

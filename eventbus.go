@@ -8,7 +8,6 @@ import (
 type Subscriber interface {
 	Subscribe(ctx context.Context, topic string, h SubscribeHandler) (err error)
 	SubscribeAsync(ctx context.Context, topic string, h SubscribeHandler) (err error)
-	Unsubscribe(topic string) error
 	// SubscribeOnce(ctx context.Context, topic string, h SubscribeHandler) (err error)
 	// SubscribeOnceAsync(ctx context.Context, topic string, h SubscribeHandler) (err error)
 }
@@ -26,5 +25,4 @@ type Publisher interface {
 type EventBus interface {
 	Publisher
 	Subscriber
-	Close() (err error)
 }
