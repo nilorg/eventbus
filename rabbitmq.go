@@ -18,36 +18,40 @@ import (
 var (
 	// ErrRabbitMQChannelNotFound ...
 	ErrRabbitMQChannelNotFound = errors.New("rabbitmq channel not found")
+	// ErrGroupIDNotFound ...
+	ErrGroupIDNotFound = errors.New("group id not found")
 )
 
 var (
 	// DefaultRabbitMQOptions 默认RabbitMQ可选项
 	DefaultRabbitMQOptions = RabbitMQOptions{
-		ExchangeName: "nilorg.eventbus",
-		ExchangeType: "topic",
-		Serialize:    &JSONSerialize{},
-		Logger:       &StdLogger{},
+		ExchangeName:        "nilorg.eventbus",
+		ExchangeType:        "topic",
+		QueueMessageExpires: 864000000, // 默认 864000000 毫秒 (10 天)
+		Serialize:           &JSONSerialize{},
+		Logger:              &StdLogger{},
 	}
 )
 
 // RabbitMQOptions RabbitMQ可选项
 type RabbitMQOptions struct {
-	ExchangeName string
-	ExchangeType string
-	Serialize    Serializer
-	Logger       Logger
+	ExchangeName        string
+	ExchangeType        string
+	QueueMessageExpires int64
+	Serialize           Serializer
+	Logger              Logger
 }
 
-type rabbitMQRoutingKey struct{}
+type groupIDKey struct{}
 
-// NewRabbitMQRoutingKeyContext ...
-func NewRabbitMQRoutingKeyContext(parent context.Context, routingKey string) context.Context {
-	return context.WithValue(parent, rabbitMQRoutingKey{}, routingKey)
+// NewGroupIDContext ...
+func NewGroupIDContext(parent context.Context, groupID string) context.Context {
+	return context.WithValue(parent, groupIDKey{}, groupID)
 }
 
-// FromRabbitMQRoutingKeyContext ...
-func FromRabbitMQRoutingKeyContext(ctx context.Context) (routingKey string, ok bool) {
-	routingKey, ok = ctx.Value(rabbitMQRoutingKey{}).(string)
+// FromGroupIDContext ...
+func FromGroupIDContext(ctx context.Context) (groupID string, ok bool) {
+	groupID, ok = ctx.Value(groupIDKey{}).(string)
 	return
 }
 
@@ -104,7 +108,7 @@ func GetGoroutineID() uint64 {
 	return n
 }
 func (bus *rabbitMQEventBus) channel() (ch *amqp.Channel, err error) {
-	bus.options.Logger.Debugf(context.Background(), "PID: %d, GoroutineID: %d Channel OK", os.Getpid(), GetGoroutineID())
+	bus.options.Logger.Debugf(context.Background(), "PID: %d, GoroutineID: %d, GroutineCount: %d, Channel OK", os.Getpid(), GetGoroutineID(), runtime.NumGoroutine())
 	v := bus.channelPool.Get()
 	ok := false
 	if v == nil {
@@ -139,14 +143,17 @@ func (bus *rabbitMQEventBus) exchangeDeclare() (err error) {
 	return
 }
 
-func (bus *rabbitMQEventBus) queueDeclare(ch *amqp.Channel, topic string) (queue amqp.Queue, err error) {
+func (bus *rabbitMQEventBus) queueDeclare(ch *amqp.Channel, groupID string) (queue amqp.Queue, err error) {
+	args := amqp.Table{
+		"x-message-ttl": bus.options.QueueMessageExpires,
+	}
 	queue, err = ch.QueueDeclare(
-		topic, // 名称
-		true,  // 持久性
-		false, // 删除未使用时
-		false, // 独有的
-		false, // 不等待
-		nil,   //参数
+		groupID, // 名称
+		true,    // 持久性
+		false,   // 删除未使用时
+		false,   // 独有的
+		false,   // 不等待
+		args,    //参数
 	)
 	return
 }
@@ -172,19 +179,16 @@ func (bus *rabbitMQEventBus) publish(ctx context.Context, topic string, v interf
 	if err != nil {
 		return
 	}
-	publishKey := ""
-	if routingKey, ok := FromRabbitMQRoutingKeyContext(ctx); ok {
-		publishKey = routingKey
-	}
+	bus.options.Logger.Debugf(ctx, "publish msg data: %s", string(data))
 	var ch *amqp.Channel
 	if ch, err = bus.channel(); err != nil {
 		return
 	}
 	err = ch.Publish(
 		bus.options.ExchangeName, //交换
-		publishKey,               //路由密钥
+		topic,                    //路由密钥
 		!async,                   //强制
-		!async,                   //立即
+		false,                    //立即
 		amqp.Publishing{
 			ContentType: bus.options.Serialize.ContentType(),
 			Body:        data,
@@ -205,35 +209,38 @@ func (bus *rabbitMQEventBus) subscribe(ctx context.Context, topic string, h Subs
 	if ch, err = bus.channel(); err != nil {
 		return
 	}
+	groupID := ""
+	groupOK := false
+	if groupID, groupOK = FromGroupIDContext(ctx); !groupOK {
+		err = ErrGroupIDNotFound
+		return
+	}
 	var queue amqp.Queue
-	// 一对多，要生产不同的 queue
-	queue, err = bus.queueDeclare(ch, topic)
+	// 一对多要生产不同的queue，根据groupID来区分
+	queue, err = bus.queueDeclare(ch, groupID)
 	if err != nil {
 		return
 	}
-	consumeQueueName := ""
-	if routingKey, ok := FromRabbitMQRoutingKeyContext(ctx); ok {
-		err = ch.QueueBind(
-			queue.Name,               // 队列
-			routingKey,               // routing key
-			bus.options.ExchangeName, // 交换
-			false,                    // 不等待
-			nil,
-		)
-		if err != nil {
-			return
-		}
-		consumeQueueName = queue.Name
+	err = ch.QueueBind(
+		queue.Name,               // 队列
+		topic,                    // routing key
+		bus.options.ExchangeName, // 交换
+		!async,                   // 不等待
+		nil,
+	)
+	if err != nil {
+		return
 	}
+
 	var msgs <-chan amqp.Delivery
 	msgs, err = ch.Consume(
-		consumeQueueName, // 队列
-		"",               // 消费者
-		false,            // 自动确认
-		false,            // 独有的
-		false,            // no-local
-		!async,           // 不等待
-		nil,              // 参数
+		queue.Name, // 队列
+		"",         // 消费者
+		false,      // 自动确认
+		false,      // 独有的
+		false,      // no-local
+		!async,     // 不等待
+		nil,        // 参数
 	)
 	if err != nil {
 		return
@@ -272,6 +279,7 @@ func (bus *rabbitMQEventBus) handleSubMessage(ctx context.Context, msgs <-chan a
 		select {
 		case msg := <-msgs:
 			var m Message
+			bus.options.Logger.Debugf(ctx, "subscribe msg data: %s", string(msg.Body))
 			if err = bus.options.Serialize.Unmarshal(msg.Body, &m); err != nil {
 				return
 			}
