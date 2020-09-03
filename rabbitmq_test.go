@@ -29,7 +29,7 @@ func TestRabbitMQEventBusSync(t *testing.T) {
 	ctx := context.Background()
 	bus := newTestEventBus(t)
 	var err error
-	topic := "order.create.success"
+	topic := "order.create.success.sync"
 	ctxGroup1 := NewGroupIDContext(ctx, "nilorg.events.sync.group1")
 	go func() {
 		err = bus.Subscribe(ctxGroup1, topic, func(ctx context.Context, msg *Message) error {
@@ -63,14 +63,13 @@ func TestRabbitMQEventBusSync(t *testing.T) {
 		}
 	}()
 	time.Sleep(1 * time.Second)
-	for i := 0; i < 10; i++ {
+	for i := 0; i < 100; i++ {
 		err = bus.Publish(ctx, topic, "sync message")
 		if err != nil {
 			t.Error(err)
 			return
 		}
 		fmt.Println("Publish sync success")
-		time.Sleep(3 * time.Second)
 	}
 	time.Sleep(time.Second * 5)
 }
@@ -79,7 +78,7 @@ func TestRabbitMQEventBusASync(t *testing.T) {
 	ctx := context.Background()
 	bus := newTestEventBus(t)
 	var err error
-	topic := "order.create.success"
+	topic := "order.create.success.async"
 	ctxGroup1 := NewGroupIDContext(ctx, "nilorg.events.async.group1")
 	err = bus.SubscribeAsync(ctxGroup1, topic, func(ctx context.Context, msg *Message) error {
 		fmt.Printf("group1 %s: %+v\n", topic, msg)
@@ -111,14 +110,13 @@ func TestRabbitMQEventBusASync(t *testing.T) {
 		return
 	}
 	time.Sleep(1 * time.Second)
-	for i := 0; i < 10; i++ {
+	for i := 0; i < 100; i++ {
 		err = bus.PublishAsync(ctx, topic, "async message", "")
 		if err != nil {
 			t.Error(err)
 			return
 		}
 		fmt.Println("Publish async success")
-		time.Sleep(3 * time.Second)
 	}
 	time.Sleep(time.Second * 5)
 }

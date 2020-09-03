@@ -3,6 +3,8 @@ package eventbus
 import (
 	"context"
 	"log"
+
+	"github.com/sirupsen/logrus"
 )
 
 // Logger logger
@@ -101,4 +103,66 @@ func (StdLogger) Errorln(ctx context.Context, args ...interface{}) {
 	}
 	nArgs = append(nArgs, args...)
 	log.Println(nArgs...)
+}
+
+// LogrusLogger ...
+type LogrusLogger struct {
+	log *logrus.Logger
+}
+
+// NewLogrusLogger ...
+func NewLogrusLogger(log *logrus.Logger) Logger {
+	return &LogrusLogger{
+		log: log,
+	}
+}
+
+// Debugf 测试
+func (l *LogrusLogger) Debugf(ctx context.Context, format string, args ...interface{}) {
+	l.log.WithContext(ctx).Debugf(format, args...)
+}
+
+// Debugln 测试
+func (l *LogrusLogger) Debugln(ctx context.Context, args ...interface{}) {
+	l.log.WithContext(ctx).Debugln(args...)
+}
+
+// Infof 信息
+func (l *LogrusLogger) Infof(ctx context.Context, format string, args ...interface{}) {
+	l.log.WithContext(ctx).Debugf(format, args...)
+}
+
+// Infoln 消息
+func (l *LogrusLogger) Infoln(ctx context.Context, args ...interface{}) {
+	l.log.WithContext(ctx).Infoln(args...)
+}
+
+// Warnf 警告
+func (l *LogrusLogger) Warnf(ctx context.Context, format string, args ...interface{}) {
+	l.log.WithContext(ctx).Warnf(format, args...)
+}
+
+// Warnln 警告
+func (l *LogrusLogger) Warnln(ctx context.Context, args ...interface{}) {
+	l.log.WithContext(ctx).Warnln(args...)
+}
+
+// Warningf 警告
+func (l *LogrusLogger) Warningf(ctx context.Context, format string, args ...interface{}) {
+	l.log.WithContext(ctx).Warningf(format, args...)
+}
+
+// Warningln 警告
+func (l *LogrusLogger) Warningln(ctx context.Context, args ...interface{}) {
+	l.log.WithContext(ctx).Warningln(args...)
+}
+
+// Errorf 错误
+func (l *LogrusLogger) Errorf(ctx context.Context, format string, args ...interface{}) {
+	l.log.WithContext(ctx).Errorf(format, args...)
+}
+
+// Errorln 错误
+func (l *LogrusLogger) Errorln(ctx context.Context, args ...interface{}) {
+	l.log.WithContext(ctx).Errorln(args...)
 }

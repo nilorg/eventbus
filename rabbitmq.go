@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"errors"
-	"fmt"
 
 	"os"
 	"runtime"
@@ -68,7 +67,6 @@ func NewRabbitMQ(conn *amqp.Connection, options *RabbitMQOptions) (bus EventBus,
 		options: &ops,
 		channelPool: &sync.Pool{
 			New: func() interface{} {
-				fmt.Println("===================创建")
 				ch, chErr := conn.Channel()
 				if chErr != nil {
 					return nil
@@ -210,6 +208,7 @@ func (bus *rabbitMQEventBus) subscribe(ctx context.Context, topic string, h Subs
 	if ch, err = bus.getChannel(); err != nil {
 		return
 	}
+	defer bus.putChannel(ch)
 	groupID := ""
 	groupOK := false
 	if groupID, groupOK = FromGroupIDContext(ctx); !groupOK {
@@ -252,11 +251,9 @@ func (bus *rabbitMQEventBus) subscribe(ctx context.Context, topic string, h Subs
 			if asyncErr := bus.handleSubMessage(ctx, msgs, h); asyncErr != nil {
 				bus.options.Logger.Errorf(context.Background(), "async subscribe %s error: %v", topic, asyncErr)
 			}
-			// bus.putChannel(ch)
 		}()
 	} else {
 		err = bus.handleSubMessage(ctx, msgs, h)
-		// bus.putChannel(ch)
 	}
 	return
 }
