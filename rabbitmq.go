@@ -168,6 +168,14 @@ func (bus *rabbitMQEventBus) publish(ctx context.Context, topic string, v interf
 		Header: make(MessageHeader),
 		Value:  v,
 	}
+	// set message header
+	if f, ok := FromSetMessageHeaderContext(ctx); ok {
+		if headers := f(ctx); headers != nil {
+			for key, value := range headers {
+				msg.Header[key] = value
+			}
+		}
+	}
 	if async {
 		msg.Header[MessageHeaderCallback] = callbackName
 	}
