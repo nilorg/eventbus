@@ -159,3 +159,64 @@ func TestRabbitMQEventBusPubMessage(t *testing.T) {
 	}
 	time.Sleep(time.Second * 5)
 }
+
+func newTestEventBusForDirect(t *testing.T) (bus EventBus) {
+	var err error
+	var conn *amqp.Connection
+	conn, err = amqp.Dial("amqp://root:test123@localhost:5672/")
+	if err != nil {
+		t.Error(err)
+		return
+	}
+	opt := DefaultRabbitMQOptions
+	opt.ExchangeName = "nilorg.eventbus.direct"
+	opt.ExchangeType = "direct"
+	bus, err = NewRabbitMQ(conn, &opt)
+	if err != nil {
+		t.Error(err)
+		return
+	}
+	return
+}
+
+func TestRabbitMQEventBusSyncForDirect(t *testing.T) {
+	ctx := context.Background()
+	bus := newTestEventBusForDirect(t)
+	var err error
+	topic := "order.create.success.sync"
+	// ctxGroup1 := NewGroupIDContext(ctx, "nilorg.events.sync.group1")
+	go func() {
+		err = bus.Subscribe(ctx, topic, func(ctx context.Context, msg *Message) error {
+			fmt.Printf("group1 %s: %+v\n", topic, msg)
+			return nil
+		})
+		if err != nil {
+			t.Error(err)
+			return
+		}
+	}()
+	// ctxGroup2 := NewGroupIDContext(ctx, "nilorg.events.sync.group2")
+	go func() {
+		err = bus.Subscribe(ctx, topic, func(ctx context.Context, msg *Message) error {
+			fmt.Printf("group2 %s: %+v\n", topic, msg)
+			return nil
+		})
+		if err != nil {
+			t.Error(err)
+			return
+		}
+	}()
+
+	time.Sleep(1 * time.Second)
+	for i := 0; i < 10; i++ {
+		err = bus.Publish(ctx, topic, Message{
+			Value: fmt.Sprintf("test direct index: %d", i),
+		})
+		if err != nil {
+			t.Error(err)
+			return
+		}
+	}
+
+	time.Sleep(time.Second * 5)
+}

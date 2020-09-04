@@ -26,6 +26,7 @@ var (
 	DefaultRabbitMQOptions = RabbitMQOptions{
 		ExchangeName:        "nilorg.eventbus",
 		ExchangeType:        "topic",
+		DefaultGroupID:      "nilorg.eventbus.default.group.v1",
 		QueueMessageExpires: 864000000, // 默认 864000000 毫秒 (10 天)
 		Serialize:           &JSONSerialize{},
 		Logger:              &StdLogger{},
@@ -36,6 +37,7 @@ var (
 type RabbitMQOptions struct {
 	ExchangeName        string
 	ExchangeType        string
+	DefaultGroupID      string
 	QueueMessageExpires int64
 	Serialize           Serializer
 	Logger              Logger
@@ -155,15 +157,15 @@ func (bus *rabbitMQEventBus) queueDeclare(ch *amqp.Channel, groupID string) (que
 	return
 }
 
-func (bus *rabbitMQEventBus) Publish(ctx context.Context, topic string, v interface{}) (err error) {
-	return bus.publish(ctx, topic, v, "", false)
+func (bus *rabbitMQEventBus) Publish(ctx context.Context, topic string, v interface{}, callbackName ...string) (err error) {
+	return bus.publish(ctx, topic, v, false, callbackName...)
 }
 
-func (bus *rabbitMQEventBus) PublishAsync(ctx context.Context, topic, callbackName string, v interface{}) (err error) {
-	return bus.publish(ctx, topic, v, callbackName, true)
+func (bus *rabbitMQEventBus) PublishAsync(ctx context.Context, topic string, v interface{}, callbackName ...string) (err error) {
+	return bus.publish(ctx, topic, v, true, callbackName...)
 }
 
-func (bus *rabbitMQEventBus) publish(ctx context.Context, topic string, v interface{}, callbackName string, async bool) (err error) {
+func (bus *rabbitMQEventBus) publish(ctx context.Context, topic string, v interface{}, async bool, callbackName ...string) (err error) {
 	var (
 		msg   *Message
 		msgOK bool
@@ -189,11 +191,11 @@ func (bus *rabbitMQEventBus) publish(ctx context.Context, topic string, v interf
 			}
 		}
 	}
-	if async {
+	if len(callbackName) > 0 {
 		if msg.Header == nil {
 			msg.Header = make(MessageHeader)
 		}
-		msg.Header[MessageHeaderCallback] = callbackName
+		msg.Header[MessageHeaderCallback] = callbackName[0]
 	}
 	var data []byte
 	data, err = bus.options.Serialize.Marshal(msg)
@@ -233,10 +235,9 @@ func (bus *rabbitMQEventBus) subscribe(ctx context.Context, topic string, h Subs
 		return
 	}
 	defer bus.putChannel(ch)
-	groupID := ""
-	groupOK := false
-	if groupID, groupOK = FromGroupIDContext(ctx); !groupOK {
-		err = ErrGroupIDNotFound
+	groupID := bus.options.DefaultGroupID
+	if gid, ok := FromGroupIDContext(ctx); ok {
+		groupID = gid
 		return
 	}
 	var queue amqp.Queue
