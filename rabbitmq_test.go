@@ -120,3 +120,42 @@ func TestRabbitMQEventBusASync(t *testing.T) {
 	}
 	time.Sleep(time.Second * 5)
 }
+
+func TestRabbitMQEventBusPubMessage(t *testing.T) {
+	ctx := context.Background()
+	bus := newTestEventBus(t)
+	var err error
+	topic := "order.create.success.sync"
+	ctxGroup1 := NewGroupIDContext(ctx, "nilorg.events.sync.group1")
+	go func() {
+		err = bus.Subscribe(ctxGroup1, topic, func(ctx context.Context, msg *Message) error {
+			fmt.Printf("group1 %s: %+v\n", topic, msg)
+			return nil
+		})
+		if err != nil {
+			t.Error(err)
+			return
+		}
+	}()
+
+	time.Sleep(1 * time.Second)
+	for i := 0; i < 10; i++ {
+		err = bus.Publish(ctx, topic, Message{
+			Value: "非指针",
+		})
+		if err != nil {
+			t.Error(err)
+			return
+		}
+	}
+	for i := 0; i < 10; i++ {
+		err = bus.Publish(ctx, topic, &Message{
+			Value: "指针",
+		})
+		if err != nil {
+			t.Error(err)
+			return
+		}
+	}
+	time.Sleep(time.Second * 5)
+}

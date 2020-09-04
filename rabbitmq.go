@@ -164,19 +164,35 @@ func (bus *rabbitMQEventBus) PublishAsync(ctx context.Context, topic, callbackNa
 }
 
 func (bus *rabbitMQEventBus) publish(ctx context.Context, topic string, v interface{}, callbackName string, async bool) (err error) {
-	msg := &Message{
-		Header: make(MessageHeader),
-		Value:  v,
+	var (
+		msg   *Message
+		msgOK bool
+	)
+	if v1, v1Ok := v.(*Message); v1Ok {
+		msg = v1
+		msgOK = true
+	} else if v2, v2Ok := v.(Message); v2Ok {
+		msg = &v2
+		msgOK = true
 	}
-	// set message header
-	if f, ok := FromSetMessageHeaderContext(ctx); ok {
-		if headers := f(ctx); headers != nil {
-			for key, value := range headers {
-				msg.Header[key] = value
+	if !msgOK {
+		msg = &Message{
+			Header: make(MessageHeader),
+			Value:  v,
+		}
+		// set message header
+		if f, ok := FromSetMessageHeaderContext(ctx); ok {
+			if headers := f(ctx); headers != nil {
+				for key, value := range headers {
+					msg.Header[key] = value
+				}
 			}
 		}
 	}
 	if async {
+		if msg.Header == nil {
+			msg.Header = make(MessageHeader)
+		}
 		msg.Header[MessageHeaderCallback] = callbackName
 	}
 	var data []byte
