@@ -111,7 +111,7 @@ func TestRabbitMQEventBusASync(t *testing.T) {
 	}
 	time.Sleep(1 * time.Second)
 	for i := 0; i < 100; i++ {
-		err = bus.PublishAsync(ctx, topic, "async message", "")
+		err = bus.PublishAsync(ctx, topic, "async message")
 		if err != nil {
 			t.Error(err)
 			return

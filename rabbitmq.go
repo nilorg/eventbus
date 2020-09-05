@@ -1,13 +1,11 @@
 package eventbus
 
 import (
-	"bytes"
 	"context"
 	"errors"
 
 	"os"
 	"runtime"
-	"strconv"
 
 	"sync"
 
@@ -17,8 +15,6 @@ import (
 var (
 	// ErrRabbitMQChannelNotFound ...
 	ErrRabbitMQChannelNotFound = errors.New("rabbitmq channel not found")
-	// ErrGroupIDNotFound ...
-	ErrGroupIDNotFound = errors.New("group id not found")
 )
 
 var (
@@ -91,18 +87,8 @@ type rabbitMQEventBus struct {
 	channelPool *sync.Pool
 }
 
-// GetGoroutineID ...
-func GetGoroutineID() uint64 {
-	b := make([]byte, 64)
-	runtime.Stack(b, false)
-	b = bytes.TrimPrefix(b, []byte("goroutine "))
-	b = b[:bytes.IndexByte(b, ' ')]
-	n, _ := strconv.ParseUint(string(b), 10, 64)
-	return n
-}
-
 func (bus *rabbitMQEventBus) getChannel() (ch *amqp.Channel, err error) {
-	bus.options.Logger.Debugf(context.Background(), "PID: %d, GoroutineID: %d, GroutineCount: %d, Channel OK", os.Getpid(), GetGoroutineID(), runtime.NumGoroutine())
+	bus.options.Logger.Debugf(context.Background(), "PID: %d, GroutineCount: %d, Channel OK", os.Getpid(), runtime.NumGoroutine())
 	v := bus.channelPool.Get()
 	ok := false
 	if v == nil {
@@ -157,15 +143,15 @@ func (bus *rabbitMQEventBus) queueDeclare(ch *amqp.Channel, groupID string) (que
 	return
 }
 
-func (bus *rabbitMQEventBus) Publish(ctx context.Context, topic string, v interface{}, callbackName ...string) (err error) {
-	return bus.publish(ctx, topic, v, false, callbackName...)
+func (bus *rabbitMQEventBus) Publish(ctx context.Context, topic string, v interface{}) (err error) {
+	return bus.publish(ctx, topic, v, false)
 }
 
-func (bus *rabbitMQEventBus) PublishAsync(ctx context.Context, topic string, v interface{}, callbackName ...string) (err error) {
-	return bus.publish(ctx, topic, v, true, callbackName...)
+func (bus *rabbitMQEventBus) PublishAsync(ctx context.Context, topic string, v interface{}) (err error) {
+	return bus.publish(ctx, topic, v, true)
 }
 
-func (bus *rabbitMQEventBus) publish(ctx context.Context, topic string, v interface{}, async bool, callbackName ...string) (err error) {
+func (bus *rabbitMQEventBus) publish(ctx context.Context, topic string, v interface{}, async bool) (err error) {
 	var (
 		msg   *Message
 		msgOK bool
@@ -190,12 +176,6 @@ func (bus *rabbitMQEventBus) publish(ctx context.Context, topic string, v interf
 				msg.Header[key] = value
 			}
 		}
-	}
-	if len(callbackName) > 0 {
-		if msg.Header == nil {
-			msg.Header = make(MessageHeader)
-		}
-		msg.Header[MessageHeaderCallback] = callbackName[0]
 	}
 	var data []byte
 	data, err = bus.options.Serialize.Marshal(msg)
