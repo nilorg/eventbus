@@ -218,7 +218,6 @@ func (bus *rabbitMQEventBus) subscribe(ctx context.Context, topic string, h Subs
 	groupID := bus.options.DefaultGroupID
 	if gid, ok := FromGroupIDContext(ctx); ok {
 		groupID = gid
-		return
 	}
 	var queue amqp.Queue
 	// 一对多要生产不同的queue，根据groupID来区分
