@@ -262,7 +262,6 @@ func (bus *rabbitMQEventBus) handleSubMessage(ctx context.Context, msgs <-chan a
 			if len(msg.Body) == 0 {
 				continue
 			}
-			bus.options.Logger.Debugf(ctx, "subscribe msg: %+v", msg)
 			m := Message{
 				Header: make(MessageHeader),
 			}
