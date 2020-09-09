@@ -17,7 +17,7 @@ func newTestEventBus(t *testing.T) (bus EventBus) {
 		t.Error(err)
 		return
 	}
-	bus, err = NewRabbitMQ(conn, nil)
+	bus, err = NewRabbitMQ(conn)
 	if err != nil {
 		t.Error(err)
 		return
