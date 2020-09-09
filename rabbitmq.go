@@ -3,6 +3,7 @@ package eventbus
 import (
 	"context"
 	"errors"
+	"fmt"
 
 	"os"
 	"runtime"
@@ -165,7 +166,7 @@ func (bus *rabbitMQEventBus) publish(ctx context.Context, topic string, v interf
 		}
 	}
 	var data []byte
-	data, err = bus.options.Serialize.Marshal(msg)
+	data, err = bus.options.Serialize.Marshal(msg.Value)
 	if err != nil {
 		return
 	}
@@ -176,12 +177,17 @@ func (bus *rabbitMQEventBus) publish(ctx context.Context, topic string, v interf
 	}
 	defer bus.putChannel(ch)
 
+	headers := make(amqp.Table)
+	for k, v := range msg.Header {
+		headers[k] = v
+	}
 	err = ch.Publish(
 		bus.options.ExchangeName, //交换
 		topic,                    //路由密钥
 		!async,                   //强制
 		false,                    //立即
 		amqp.Publishing{
+			Headers:     headers,
 			ContentType: bus.options.Serialize.ContentType(),
 			Body:        data,
 		})
@@ -253,9 +259,19 @@ func (bus *rabbitMQEventBus) handleSubMessage(ctx context.Context, msgs <-chan a
 	for {
 		select {
 		case msg := <-msgs:
-			var m Message
+			if len(msg.Body) == 0 {
+				continue
+			}
+			bus.options.Logger.Debugf(ctx, "subscribe msg: %+v", msg)
+			m := Message{
+				Header: make(MessageHeader),
+			}
+			for k, v := range msg.Headers {
+				m.Header[k] = fmt.Sprint(v)
+			}
+
 			bus.options.Logger.Debugf(ctx, "subscribe msg data: %s", string(msg.Body))
-			if err = bus.options.Serialize.Unmarshal(msg.Body, &m); err != nil {
+			if err = bus.options.Serialize.Unmarshal(msg.Body, &m.Value); err != nil {
 				return
 			}
 			if err = h(ctx, &m); err == nil {

@@ -4,8 +4,8 @@ import "encoding/json"
 
 // Serializer 序列化器
 type Serializer interface {
-	Unmarshal(data []byte, msg *Message) (err error)
-	Marshal(msg *Message) (data []byte, err error)
+	Unmarshal(data []byte, msg interface{}) (err error)
+	Marshal(msg interface{}) (data []byte, err error)
 	ContentType() string
 }
 
@@ -14,12 +14,12 @@ type JSONSerialize struct {
 }
 
 // Unmarshal ...
-func (JSONSerialize) Unmarshal(data []byte, msg *Message) (err error) {
+func (JSONSerialize) Unmarshal(data []byte, msg interface{}) (err error) {
 	return json.Unmarshal(data, msg)
 }
 
 // Marshal ...
-func (JSONSerialize) Marshal(msg *Message) (data []byte, err error) {
+func (JSONSerialize) Marshal(msg interface{}) (data []byte, err error) {
 	return json.Marshal(msg)
 }
 
