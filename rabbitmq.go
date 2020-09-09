@@ -39,26 +39,13 @@ type RabbitMQOptions struct {
 	Logger              Logger
 }
 
-type groupIDKey struct{}
-
-// NewGroupIDContext ...
-func NewGroupIDContext(parent context.Context, groupID string) context.Context {
-	return context.WithValue(parent, groupIDKey{}, groupID)
-}
-
-// FromGroupIDContext ...
-func FromGroupIDContext(ctx context.Context) (groupID string, ok bool) {
-	groupID, ok = ctx.Value(groupIDKey{}).(string)
-	return
-}
-
 // NewRabbitMQ 创建RabbitMQ事件总线
-func NewRabbitMQ(conn *amqp.Connection, options *RabbitMQOptions) (bus EventBus, err error) {
+func NewRabbitMQ(conn *amqp.Connection, options ...*RabbitMQOptions) (bus EventBus, err error) {
 	var ops RabbitMQOptions
-	if options == nil {
+	if len(options) == 0 {
 		ops = DefaultRabbitMQOptions
 	} else {
-		ops = *options
+		ops = *options[0]
 	}
 	rbus := &rabbitMQEventBus{
 		conn:    conn,
