@@ -208,7 +208,7 @@ func (bus *rabbitMQEventBus) subscribe(ctx context.Context, topic string, h Subs
 	defer bus.putChannel(ch)
 	groupID := fmt.Sprintf("%s.default.group.%s", topic, Version)
 	if gid, ok := FromGroupIDContext(ctx); ok {
-		groupID = gid
+		groupID = fmt.Sprintf("%s-%s.group.%s", topic, gid, Version)
 	}
 	var queue amqp.Queue
 	// 一对多要生产不同的queue，根据groupID来区分
