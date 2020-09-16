@@ -4,6 +4,11 @@ import (
 	"context"
 )
 
+var (
+	// Version 版本
+	Version = "v1"
+)
+
 // Subscriber 订阅接口
 type Subscriber interface {
 	Subscribe(ctx context.Context, topic string, h SubscribeHandler) (err error)

@@ -23,7 +23,6 @@ var (
 	DefaultRabbitMQOptions = RabbitMQOptions{
 		ExchangeName:        "nilorg.eventbus",
 		ExchangeType:        "topic",
-		DefaultGroupID:      "nilorg.eventbus.default.group.v1",
 		QueueMessageExpires: 864000000, // 默认 864000000 毫秒 (10 天)
 		Serialize:           &JSONSerialize{},
 		Logger:              &StdLogger{},
@@ -34,7 +33,6 @@ var (
 type RabbitMQOptions struct {
 	ExchangeName        string
 	ExchangeType        string
-	DefaultGroupID      string
 	QueueMessageExpires int64
 	Serialize           Serializer
 	Logger              Logger
@@ -208,7 +206,7 @@ func (bus *rabbitMQEventBus) subscribe(ctx context.Context, topic string, h Subs
 		return
 	}
 	defer bus.putChannel(ch)
-	groupID := bus.options.DefaultGroupID
+	groupID := fmt.Sprintf("%s.default.group.%s", topic, Version)
 	if gid, ok := FromGroupIDContext(ctx); ok {
 		groupID = gid
 	}
