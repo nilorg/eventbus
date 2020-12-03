@@ -226,7 +226,11 @@ func (bus *rabbitMQEventBus) subscribe(ctx context.Context, topic string, h Subs
 	if err != nil {
 		return
 	}
-
+	// 公平分配，每个消费者一次取一个
+	err = ch.Qos(1, 0, false)
+	if err != nil {
+		return
+	}
 	var msgs <-chan amqp.Delivery
 	msgs, err = ch.Consume(
 		queue.Name, // 队列
