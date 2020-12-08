@@ -114,17 +114,17 @@ func (bus *rabbitMQEventBus) exchangeDeclare() (err error) {
 	return
 }
 
-func (bus *rabbitMQEventBus) queueDeclare(ch *amqp.Channel, groupID string) (queue amqp.Queue, err error) {
+func (bus *rabbitMQEventBus) queueDeclare(ch *amqp.Channel, queueName string) (queue amqp.Queue, err error) {
 	args := amqp.Table{
 		"x-message-ttl": bus.options.QueueMessageExpires,
 	}
 	queue, err = ch.QueueDeclare(
-		groupID, // 名称
-		true,    // 持久性
-		false,   // 删除未使用时
-		false,   // 独有的
-		false,   // 不等待
-		args,    //参数
+		queueName, // 名称
+		true,      // 持久性
+		false,     // 删除未使用时
+		false,     // 独有的
+		false,     // 不等待
+		args,      //参数
 	)
 	return
 }
@@ -206,13 +206,15 @@ func (bus *rabbitMQEventBus) subscribe(ctx context.Context, topic string, h Subs
 		return
 	}
 	defer bus.putChannel(ch)
-	groupID := fmt.Sprintf("%s.default.group.%s", topic, Version)
+	queueName := fmt.Sprintf("%s.default.group.%s", topic, Version)
+	var consumer string
 	if gid, ok := FromGroupIDContext(ctx); ok {
-		groupID = fmt.Sprintf("%s-%s.group.%s", topic, gid, Version)
+		queueName = fmt.Sprintf("%s-%s.group.%s", topic, gid, Version)
+		consumer = gid
 	}
 	var queue amqp.Queue
 	// 一对多要生产不同的queue，根据groupID来区分
-	queue, err = bus.queueDeclare(ch, groupID)
+	queue, err = bus.queueDeclare(ch, queueName)
 	if err != nil {
 		return
 	}
@@ -234,7 +236,7 @@ func (bus *rabbitMQEventBus) subscribe(ctx context.Context, topic string, h Subs
 	var msgs <-chan amqp.Delivery
 	msgs, err = ch.Consume(
 		queue.Name, // 队列
-		"",         // 消费者
+		consumer,   // 消费者
 		false,      // 自动确认
 		false,      // 独有的
 		false,      // no-local
