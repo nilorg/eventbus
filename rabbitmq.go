@@ -4,12 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 
 	"os"
 	"runtime"
 
-	"sync"
-
+	"github.com/nilorg/sdk/pool"
 	"github.com/streadway/amqp"
 )
 
@@ -26,16 +26,19 @@ var (
 		QueueMessageExpires: 864000000, // 默认 864000000 毫秒 (10 天)
 		Serialize:           &JSONSerialize{},
 		Logger:              &StdLogger{},
+		PoolMinOpen:         1,
+		PoolMaxOpen:         10,
 	}
 )
 
 // RabbitMQOptions RabbitMQ可选项
 type RabbitMQOptions struct {
-	ExchangeName        string
-	ExchangeType        string
-	QueueMessageExpires int64
-	Serialize           Serializer
-	Logger              Logger
+	ExchangeName             string
+	ExchangeType             string
+	QueueMessageExpires      int64
+	Serialize                Serializer
+	Logger                   Logger
+	PoolMinOpen, PoolMaxOpen int
 }
 
 // NewRabbitMQ 创建RabbitMQ事件总线
@@ -46,18 +49,17 @@ func NewRabbitMQ(conn *amqp.Connection, options ...*RabbitMQOptions) (bus EventB
 	} else {
 		ops = *options[0]
 	}
+	var channelPool pool.Pooler
+	channelPool, err = pool.NewCommonPool(ops.PoolMinOpen, ops.PoolMaxOpen, func() (io.Closer, error) {
+		return conn.Channel()
+	})
+	if err != nil {
+		return
+	}
 	rbus := &rabbitMQEventBus{
-		conn:    conn,
-		options: &ops,
-		channelPool: &sync.Pool{
-			New: func() interface{} {
-				ch, chErr := conn.Channel()
-				if chErr != nil {
-					return nil
-				}
-				return ch
-			},
-		},
+		conn:        conn,
+		options:     &ops,
+		channelPool: channelPool,
 	}
 	err = rbus.exchangeDeclare()
 	if err != nil {
@@ -70,23 +72,19 @@ func NewRabbitMQ(conn *amqp.Connection, options ...*RabbitMQOptions) (bus EventB
 type rabbitMQEventBus struct {
 	options     *RabbitMQOptions
 	conn        *amqp.Connection
-	channelPool *sync.Pool
+	channelPool pool.Pooler
 }
 
 func (bus *rabbitMQEventBus) getChannel() (ch *amqp.Channel, err error) {
 	bus.options.Logger.Debugf(context.Background(), "PID: %d, GroutineCount: %d, Channel OK", os.Getpid(), runtime.NumGoroutine())
-	v := bus.channelPool.Get()
-	ok := false
-	if v == nil {
-		ch, err = bus.conn.Channel()
-		if err != nil {
-			return
-		}
+	var v io.Closer
+	v, err = bus.channelPool.Get()
+	if err != nil {
 		return
 	}
+	ok := false
 	if ch, ok = v.(*amqp.Channel); !ok {
 		err = ErrRabbitMQChannelNotFound
-		return
 	}
 	return
 }
