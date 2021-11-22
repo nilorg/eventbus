@@ -199,12 +199,10 @@ func (bus *rabbitMQEventBus) SubscribeAsync(ctx context.Context, topic string, h
 }
 
 func (bus *rabbitMQEventBus) subscribe(ctx context.Context, topic string, h SubscribeHandler, async bool) (err error) {
-	fmt.Println("==========================订阅1：", topic)
 	var ch *amqp.Channel
 	if ch, err = bus.getChannel(ctx); err != nil {
 		return
 	}
-	fmt.Println("==========================订阅2：", topic)
 	queueName := fmt.Sprintf("%s.default.group.%s", topic, Version)
 	if gid, ok := FromGroupIDContext(ctx); ok {
 		queueName = fmt.Sprintf("%s-%s.group.%s", topic, gid, Version)
