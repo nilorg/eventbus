@@ -122,11 +122,11 @@ func (bus *redisEventBus) subscribe(ctx context.Context, topic string, h Subscri
 	// 一对多要生产不同的消费组，根据groupID来区分
 	bus.conn.XGroupCreate(ctx, topic, queueName, "0-0")
 	if async {
-		go func() {
-			if asyncErr := bus.xReadGroup(ctx, topic, queueName, consumer, h); asyncErr != nil {
-				bus.options.Logger.Errorf(context.Background(), "async subscribe %s error: %v", topic, asyncErr)
+		go func(subCtx context.Context) {
+			if asyncErr := bus.xReadGroup(subCtx, topic, queueName, consumer, h); asyncErr != nil {
+				bus.options.Logger.Errorf(subCtx, "async subscribe %s error: %v", topic, asyncErr)
 			}
-		}()
+		}(ctx)
 	} else {
 		err = bus.xReadGroup(ctx, topic, queueName, consumer, h)
 	}
@@ -134,7 +134,7 @@ func (bus *redisEventBus) subscribe(ctx context.Context, topic string, h Subscri
 }
 
 func (bus *redisEventBus) xReadGroup(ctx context.Context, stream, group, consumer string, h SubscribeHandler) (err error) {
-	for true {
+	for {
 		select {
 		case <-ctx.Done():
 			return
@@ -161,13 +161,13 @@ func (bus *redisEventBus) xReadGroup(ctx context.Context, stream, group, consume
 				s := streams[i]
 				msgLen := len(s.Messages)
 				for j := 0; j < msgLen; j++ {
-					err = bus.handleSubMessage(ctx, s.Stream, group, s.Messages[j], h)
+					if err = bus.handleSubMessage(ctx, s.Stream, group, s.Messages[j], h); err != nil {
+						return
+					}
 				}
 			}
-
 		}
 	}
-	return
 }
 
 func (bus *redisEventBus) handleSubMessage(ctx context.Context, stream, group string, msg redis.XMessage, h SubscribeHandler) (err error) {
