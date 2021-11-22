@@ -61,7 +61,7 @@ func NewRabbitMQ(conn *amqp.Connection, options ...*RabbitMQOptions) (bus EventB
 		options:     &ops,
 		channelPool: channelPool,
 	}
-	err = rbus.exchangeDeclare()
+	err = rbus.exchangeDeclare(context.Background())
 	if err != nil {
 		return
 	}
@@ -75,8 +75,8 @@ type rabbitMQEventBus struct {
 	channelPool pool.Pooler
 }
 
-func (bus *rabbitMQEventBus) getChannel() (ch *amqp.Channel, err error) {
-	bus.options.Logger.Debugf(context.Background(), "PID: %d, GroutineCount: %d, Channel OK", os.Getpid(), runtime.NumGoroutine())
+func (bus *rabbitMQEventBus) getChannel(ctx context.Context) (ch *amqp.Channel, err error) {
+	bus.options.Logger.Debugf(ctx, "Get Channel, PID: %d, GroutineCount: %d, Channel OK", os.Getpid(), runtime.NumGoroutine())
 	var v io.Closer
 	v, err = bus.channelPool.Get()
 	if err != nil {
@@ -93,9 +93,9 @@ func (bus *rabbitMQEventBus) putChannel(ch *amqp.Channel) {
 	bus.channelPool.Put(ch)
 }
 
-func (bus *rabbitMQEventBus) exchangeDeclare() (err error) {
+func (bus *rabbitMQEventBus) exchangeDeclare(ctx context.Context) (err error) {
 	var ch *amqp.Channel
-	if ch, err = bus.getChannel(); err != nil {
+	if ch, err = bus.getChannel(ctx); err != nil {
 		return
 	}
 	defer bus.putChannel(ch)
@@ -168,7 +168,7 @@ func (bus *rabbitMQEventBus) publish(ctx context.Context, topic string, v interf
 	}
 	bus.options.Logger.Debugf(ctx, "publish msg data: %s", string(data))
 	var ch *amqp.Channel
-	if ch, err = bus.getChannel(); err != nil {
+	if ch, err = bus.getChannel(ctx); err != nil {
 		return
 	}
 	defer bus.putChannel(ch)
@@ -199,16 +199,15 @@ func (bus *rabbitMQEventBus) SubscribeAsync(ctx context.Context, topic string, h
 }
 
 func (bus *rabbitMQEventBus) subscribe(ctx context.Context, topic string, h SubscribeHandler, async bool) (err error) {
+	fmt.Println("==========================订阅1：", topic)
 	var ch *amqp.Channel
-	if ch, err = bus.getChannel(); err != nil {
+	if ch, err = bus.getChannel(ctx); err != nil {
 		return
 	}
-	defer bus.putChannel(ch)
+	fmt.Println("==========================订阅2：", topic)
 	queueName := fmt.Sprintf("%s.default.group.%s", topic, Version)
-	var consumer string
 	if gid, ok := FromGroupIDContext(ctx); ok {
 		queueName = fmt.Sprintf("%s-%s.group.%s", topic, gid, Version)
-		consumer = gid
 	}
 	var queue amqp.Queue
 	// 一对多要生产不同的queue，根据groupID来区分
@@ -234,7 +233,7 @@ func (bus *rabbitMQEventBus) subscribe(ctx context.Context, topic string, h Subs
 	var msgs <-chan amqp.Delivery
 	msgs, err = ch.Consume(
 		queue.Name, // 队列
-		consumer,   // 消费者
+		"",         // 消费者
 		false,      // 自动确认
 		false,      // 独有的
 		false,      // no-local
@@ -246,13 +245,15 @@ func (bus *rabbitMQEventBus) subscribe(ctx context.Context, topic string, h Subs
 	}
 
 	if async {
-		go func() {
-			if asyncErr := bus.handleSubMessage(ctx, msgs, h); asyncErr != nil {
-				bus.options.Logger.Errorf(context.Background(), "async subscribe %s error: %v", topic, asyncErr)
+		go func(subCtx context.Context, subCh *amqp.Channel) {
+			if asyncErr := bus.handleSubMessage(subCtx, msgs, h); asyncErr != nil {
+				bus.options.Logger.Errorf(subCtx, "async subscribe %s error: %v", topic, asyncErr)
 			}
-		}()
+			bus.putChannel(subCh)
+		}(ctx, ch)
 	} else {
 		err = bus.handleSubMessage(ctx, msgs, h)
+		bus.putChannel(ch)
 	}
 	return
 }
