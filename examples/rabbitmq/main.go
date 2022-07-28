@@ -9,8 +9,8 @@ import (
 	"runtime"
 	"time"
 
+	"github.com/isayme/go-amqp-reconnect/rabbitmq"
 	"github.com/nilorg/eventbus"
-	"github.com/streadway/amqp"
 )
 
 func main() {
@@ -18,8 +18,8 @@ func main() {
 		http.ListenAndServe("0.0.0.0:6060", nil)
 	}()
 	var err error
-	var conn *amqp.Connection
-	conn, err = amqp.Dial("amqp://guest:guest@localhost:5672/")
+	var conn *rabbitmq.Connection
+	conn, err = rabbitmq.Dial("amqp://guest:guest@localhost:5672/")
 	if err != nil {
 		panic(err)
 	}
@@ -185,9 +185,9 @@ func main() {
 		go func() {
 			err = bus.PublishAsync(ctx, topic, fmt.Sprintf("async message: %d", i))
 			if err != nil {
-				panic(err)
+				fmt.Printf("publish error: %s\n", err)
 			}
-			fmt.Println("===============发送消息结束")
+			fmt.Println("===============1发送消息结束")
 		}()
 		time.Sleep(10 * time.Millisecond)
 	}
@@ -196,9 +196,20 @@ func main() {
 		go func() {
 			err = bus.PublishAsync(ctx, topic, fmt.Sprintf("async message: %d", i))
 			if err != nil {
-				panic(err)
+				fmt.Printf("publish error: %s\n", err)
 			}
-			fmt.Println("===============发送消息结束")
+			fmt.Println("===============2发送消息结束")
+		}()
+		time.Sleep(10 * time.Millisecond)
+	}
+	time.Sleep(120 * time.Second)
+	for i := 0; i < 10; i++ {
+		go func() {
+			err = bus.PublishAsync(ctx, topic, fmt.Sprintf("async message: %d", i))
+			if err != nil {
+				fmt.Printf("publish error: %s\n", err)
+			}
+			fmt.Println("===============3发送消息结束")
 		}()
 		time.Sleep(10 * time.Millisecond)
 	}
