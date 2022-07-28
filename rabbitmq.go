@@ -6,9 +6,7 @@ import (
 	"fmt"
 	"io"
 
-	"os"
-	"runtime"
-
+	"github.com/isayme/go-amqp-reconnect/rabbitmq"
 	"github.com/nilorg/sdk/pool"
 	"github.com/streadway/amqp"
 )
@@ -42,7 +40,7 @@ type RabbitMQOptions struct {
 }
 
 // NewRabbitMQ 创建RabbitMQ事件总线
-func NewRabbitMQ(conn *amqp.Connection, options ...*RabbitMQOptions) (bus EventBus, err error) {
+func NewRabbitMQ(conn *rabbitmq.Connection, options ...*RabbitMQOptions) (bus EventBus, err error) {
 	var ops RabbitMQOptions
 	if len(options) == 0 {
 		ops = DefaultRabbitMQOptions
@@ -71,30 +69,29 @@ func NewRabbitMQ(conn *amqp.Connection, options ...*RabbitMQOptions) (bus EventB
 
 type rabbitMQEventBus struct {
 	options     *RabbitMQOptions
-	conn        *amqp.Connection
+	conn        *rabbitmq.Connection
 	channelPool pool.Pooler
 }
 
-func (bus *rabbitMQEventBus) getChannel(ctx context.Context) (ch *amqp.Channel, err error) {
-	bus.options.Logger.Debugf(ctx, "Get Channel, PID: %d, GroutineCount: %d, Channel OK", os.Getpid(), runtime.NumGoroutine())
+func (bus *rabbitMQEventBus) getChannel(ctx context.Context) (ch *rabbitmq.Channel, err error) {
 	var v io.Closer
 	v, err = bus.channelPool.Get()
 	if err != nil {
 		return
 	}
 	ok := false
-	if ch, ok = v.(*amqp.Channel); !ok {
+	if ch, ok = v.(*rabbitmq.Channel); !ok {
 		err = ErrRabbitMQChannelNotFound
 	}
 	return
 }
 
-func (bus *rabbitMQEventBus) putChannel(ch *amqp.Channel) {
+func (bus *rabbitMQEventBus) putChannel(ch *rabbitmq.Channel) {
 	bus.channelPool.Put(ch)
 }
 
 func (bus *rabbitMQEventBus) exchangeDeclare(ctx context.Context) (err error) {
-	var ch *amqp.Channel
+	var ch *rabbitmq.Channel
 	if ch, err = bus.getChannel(ctx); err != nil {
 		return
 	}
@@ -112,7 +109,7 @@ func (bus *rabbitMQEventBus) exchangeDeclare(ctx context.Context) (err error) {
 	return
 }
 
-func (bus *rabbitMQEventBus) queueDeclare(ch *amqp.Channel, queueName string) (queue amqp.Queue, err error) {
+func (bus *rabbitMQEventBus) queueDeclare(ch *rabbitmq.Channel, queueName string) (queue amqp.Queue, err error) {
 	args := amqp.Table{
 		"x-message-ttl": bus.options.QueueMessageExpires,
 	}
@@ -167,7 +164,7 @@ func (bus *rabbitMQEventBus) publish(ctx context.Context, topic string, v interf
 		return
 	}
 	bus.options.Logger.Debugf(ctx, "publish msg data: %s", string(data))
-	var ch *amqp.Channel
+	var ch *rabbitmq.Channel
 	if ch, err = bus.getChannel(ctx); err != nil {
 		return
 	}
@@ -199,7 +196,7 @@ func (bus *rabbitMQEventBus) SubscribeAsync(ctx context.Context, topic string, h
 }
 
 func (bus *rabbitMQEventBus) subscribe(ctx context.Context, topic string, h SubscribeHandler, async bool) (err error) {
-	var ch *amqp.Channel
+	var ch *rabbitmq.Channel
 	if ch, err = bus.getChannel(ctx); err != nil {
 		return
 	}
@@ -243,7 +240,7 @@ func (bus *rabbitMQEventBus) subscribe(ctx context.Context, topic string, h Subs
 	}
 
 	if async {
-		go func(subCtx context.Context, subCh *amqp.Channel) {
+		go func(subCtx context.Context, subCh *rabbitmq.Channel) {
 			if asyncErr := bus.handleSubMessage(subCtx, msgs, h); asyncErr != nil {
 				bus.options.Logger.Errorf(subCtx, "async subscribe %s error: %v", topic, asyncErr)
 			}

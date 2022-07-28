@@ -6,13 +6,13 @@ import (
 	"testing"
 	"time"
 
-	"github.com/streadway/amqp"
+	"github.com/isayme/go-amqp-reconnect/rabbitmq"
 )
 
 func newTestEventBus(t *testing.T) (bus EventBus) {
 	var err error
-	var conn *amqp.Connection
-	conn, err = amqp.Dial("amqp://root:test123@localhost:5672/")
+	var conn *rabbitmq.Connection
+	conn, err = rabbitmq.Dial("amqp://root:test123@localhost:5672/")
 	if err != nil {
 		t.Error(err)
 		return
@@ -162,8 +162,8 @@ func TestRabbitMQEventBusPubMessage(t *testing.T) {
 
 func newTestEventBusForDirect(t *testing.T) (bus EventBus) {
 	var err error
-	var conn *amqp.Connection
-	conn, err = amqp.Dial("amqp://root:test123@localhost:5672/")
+	var conn *rabbitmq.Connection
+	conn, err = rabbitmq.Dial("amqp://root:test123@localhost:5672/")
 	if err != nil {
 		t.Error(err)
 		return
