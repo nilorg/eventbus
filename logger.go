@@ -4,7 +4,9 @@ import (
 	"context"
 	"log"
 
+	"github.com/nilorg/pkg/zlog"
 	"github.com/sirupsen/logrus"
+	"go.uber.org/zap"
 )
 
 // Logger logger
@@ -165,4 +167,125 @@ func (l *LogrusLogger) Errorf(ctx context.Context, format string, args ...interf
 // Errorln 错误
 func (l *LogrusLogger) Errorln(ctx context.Context, args ...interface{}) {
 	l.log.WithContext(ctx).Errorln(args...)
+}
+
+// ZapLogger ...
+type ZapLogger struct {
+	log *zap.Logger
+}
+
+// NewZapLogger ...
+func NewZapLogger(log *zap.Logger) Logger {
+	return &ZapLogger{
+		log: log,
+	}
+}
+
+// Debugf 测试
+func (l *ZapLogger) Debugf(ctx context.Context, format string, args ...interface{}) {
+	l.log.Sugar().Debugf(format, args...)
+}
+
+// Debugln 测试
+func (l *ZapLogger) Debugln(ctx context.Context, args ...interface{}) {
+	l.log.Sugar().Debugln(args...)
+}
+
+// Infof 信息
+func (l *ZapLogger) Infof(ctx context.Context, format string, args ...interface{}) {
+	l.log.Sugar().Debugf(format, args...)
+}
+
+// Infoln 消息
+func (l *ZapLogger) Infoln(ctx context.Context, args ...interface{}) {
+	l.log.Sugar().Infoln(args...)
+}
+
+// Warnf 警告
+func (l *ZapLogger) Warnf(ctx context.Context, format string, args ...interface{}) {
+	l.log.Sugar().Warnf(format, args...)
+}
+
+// Warnln 警告
+func (l *ZapLogger) Warnln(ctx context.Context, args ...interface{}) {
+	l.log.Sugar().Warnln(args...)
+}
+
+// Warningf 警告
+func (l *ZapLogger) Warningf(ctx context.Context, format string, args ...interface{}) {
+	l.log.Sugar().Warnf(format, args...)
+}
+
+// Warningln 警告
+func (l *ZapLogger) Warningln(ctx context.Context, args ...interface{}) {
+	l.log.Sugar().Warnln(args...)
+}
+
+// Errorf 错误
+func (l *ZapLogger) Errorf(ctx context.Context, format string, args ...interface{}) {
+	l.log.Sugar().Errorf(format, args...)
+}
+
+// Errorln 错误
+func (l *ZapLogger) Errorln(ctx context.Context, args ...interface{}) {
+	l.log.Sugar().Errorln(args...)
+}
+
+// ZLogger ...
+type ZLogger struct {
+}
+
+// NewZapLogger ...
+func NewZLogger() Logger {
+	return &ZapLogger{}
+}
+
+// Debugf 测试
+func (*ZLogger) Debugf(ctx context.Context, format string, args ...interface{}) {
+	zlog.WithSugared(ctx).Debugf(format, args...)
+}
+
+// Debugln 测试
+func (*ZLogger) Debugln(ctx context.Context, args ...interface{}) {
+	zlog.WithSugared(ctx).Debugln(args...)
+}
+
+// Infof 信息
+func (*ZLogger) Infof(ctx context.Context, format string, args ...interface{}) {
+	zlog.WithSugared(ctx).Debugf(format, args...)
+}
+
+// Infoln 消息
+func (*ZLogger) Infoln(ctx context.Context, args ...interface{}) {
+	zlog.WithSugared(ctx).Infoln(args...)
+}
+
+// Warnf 警告
+func (*ZLogger) Warnf(ctx context.Context, format string, args ...interface{}) {
+	zlog.WithSugared(ctx).Warnf(format, args...)
+}
+
+// Warnln 警告
+func (*ZLogger) Warnln(ctx context.Context, args ...interface{}) {
+	zlog.WithSugared(ctx).Warnln(args...)
+}
+
+// Warningf 警告
+func (*ZLogger) Warningf(ctx context.Context, format string, args ...interface{}) {
+	zlog.WithSugared(ctx).Warnf(format, args...)
+}
+
+// Warningln 警告
+func (*ZLogger) Warningln(ctx context.Context, args ...interface{}) {
+	zlog.WithSugared(ctx).Warnln(args...)
+}
+
+// Errorf 错误
+func (*ZLogger) Errorf(ctx context.Context, format string, args ...interface{}) {
+	zlog.WithSugared(ctx).Errorf(format, args...)
+}
+
+// Errorln 错误
+func (*ZLogger) Errorln(ctx context.Context, args ...interface{}) {
+	zlog.WithSugared(ctx).Errorln(args...)
 }
