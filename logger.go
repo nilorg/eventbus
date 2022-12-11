@@ -237,7 +237,7 @@ type ZLogger struct {
 
 // NewZapLogger ...
 func NewZLogger() Logger {
-	return &ZapLogger{}
+	return &ZLogger{}
 }
 
 // Debugf 测试
