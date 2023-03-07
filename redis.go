@@ -120,7 +120,11 @@ func (bus *redisEventBus) subscribe(ctx context.Context, topic string, h Subscri
 	}
 
 	// 一对多要生产不同的消费组，根据groupID来区分
-	bus.conn.XGroupCreate(ctx, topic, queueName, "0-0")
+	err = bus.conn.XGroupCreateMkStream(ctx, topic, queueName, "0-0").Err()
+	if err != nil {
+		bus.options.Logger.Errorf(ctx, "XGroupCreateMkStream: %v", err)
+		return
+	}
 	if async {
 		go func(subCtx context.Context) {
 			if asyncErr := bus.xReadGroup(subCtx, topic, queueName, consumer, h); asyncErr != nil {
