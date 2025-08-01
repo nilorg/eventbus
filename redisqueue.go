@@ -90,39 +90,49 @@ func (bus *redisQueueEventBus) publish(ctx context.Context, topic string, v inte
 		}
 	}
 
-	// 创建队列消息
-	queueMsg := &QueueMessage{
-		ID:     fmt.Sprintf("%d", time.Now().UnixNano()),
-		Topic:  topic,
-		Header: msg.Header,
-		Value:  msg.Value,
-	}
-
-	// 如果有GroupID，设置到消息中
+	// 根据是否有GroupID来决定队列名称
+	queueName := topic
 	if gid, ok := FromGroupIDContext(ctx); ok {
-		queueMsg.GroupID = gid
+		// 为了支持消费组，发布到特定消费组的队列
+		queueName = fmt.Sprintf("%s:group:%s", topic, gid)
 	}
 
-	var msgData []byte
-	msgData, err = bus.options.Serialize.Marshal(queueMsg)
+	var msgHeader []byte
+	msgHeader, err = bus.options.Serialize.Marshal(msg.Header)
+	if err != nil {
+		return
+	}
+	var msgValue []byte
+	msgValue, err = bus.options.Serialize.Marshal(msg.Value)
 	if err != nil {
 		return
 	}
 
-	bus.options.Logger.Debugf(ctx, "publish queue msg data: %s", string(msgData))
+	bus.options.Logger.Debugf(ctx, "publish queue msg data: %s", string(msgValue))
+
+	// 构建队列消息，使用与redis.go相同的格式
+	queueMsg := map[string]interface{}{
+		"header": string(msgHeader),
+		"value":  string(msgValue),
+	}
+	var queueMsgData []byte
+	queueMsgData, err = bus.options.Serialize.Marshal(queueMsg)
+	if err != nil {
+		return
+	}
 
 	if async {
 		go func() {
 			// 异步发布到Redis List
-			if asyncErr := bus.conn.LPush(ctx, topic, string(msgData)).Err(); asyncErr != nil {
-				bus.options.Logger.Errorf(ctx, "async publish to queue %s error: %v", topic, asyncErr)
+			if asyncErr := bus.conn.LPush(ctx, queueName, string(queueMsgData)).Err(); asyncErr != nil {
+				bus.options.Logger.Errorf(ctx, "async publish to queue %s error: %v", queueName, asyncErr)
 			}
 		}()
 		return
 	}
 
 	// 同步发布到Redis List
-	err = bus.conn.LPush(ctx, topic, string(msgData)).Err()
+	err = bus.conn.LPush(ctx, queueName, string(queueMsgData)).Err()
 	return
 }
 
@@ -137,27 +147,25 @@ func (bus *redisQueueEventBus) SubscribeAsync(ctx context.Context, topic string,
 func (bus *redisQueueEventBus) subscribe(ctx context.Context, topic string, h SubscribeHandler, async bool) (err error) {
 	// 根据是否有GroupID来决定队列名称
 	queueName := topic
-	var groupID string
 	if gid, ok := FromGroupIDContext(ctx); ok {
-		groupID = gid
 		// 为了支持消费组，我们使用不同的队列名称
 		queueName = fmt.Sprintf("%s:group:%s", topic, gid)
 	}
 
 	if async {
 		go func(subCtx context.Context) {
-			if asyncErr := bus.consumeQueue(subCtx, queueName, groupID, h); asyncErr != nil {
+			if asyncErr := bus.consumeQueue(subCtx, queueName, h); asyncErr != nil {
 				bus.options.Logger.Errorf(subCtx, "async subscribe queue %s error: %v", queueName, asyncErr)
 			}
 		}(ctx)
 		return
 	}
 
-	err = bus.consumeQueue(ctx, queueName, groupID, h)
+	err = bus.consumeQueue(ctx, queueName, h)
 	return
 }
 
-func (bus *redisQueueEventBus) consumeQueue(ctx context.Context, queueName, groupID string, h SubscribeHandler) (err error) {
+func (bus *redisQueueEventBus) consumeQueue(ctx context.Context, queueName string, h SubscribeHandler) (err error) {
 	for {
 		select {
 		case <-ctx.Done():
@@ -186,7 +194,7 @@ func (bus *redisQueueEventBus) consumeQueue(ctx context.Context, queueName, grou
 			}
 
 			msgData := result[1]
-			if err = bus.handleQueueMessage(ctx, msgData, groupID, h); err != nil {
+			if err = bus.handleQueueMessage(ctx, msgData, h); err != nil {
 				bus.options.Logger.Errorf(ctx, "handle queue message error: %v", err)
 				// 处理消息失败，继续处理下一条消息
 				continue
@@ -195,34 +203,36 @@ func (bus *redisQueueEventBus) consumeQueue(ctx context.Context, queueName, grou
 	}
 }
 
-func (bus *redisQueueEventBus) handleQueueMessage(ctx context.Context, msgData, expectedGroupID string, h SubscribeHandler) (err error) {
-	var queueMsg QueueMessage
+func (bus *redisQueueEventBus) handleQueueMessage(ctx context.Context, msgData string, h SubscribeHandler) (err error) {
+	// 解析队列消息，格式与redis.go保持一致
+	var queueMsg map[string]interface{}
 	if err = bus.options.Serialize.Unmarshal([]byte(msgData), &queueMsg); err != nil {
 		return
 	}
 
-	// 如果指定了GroupID，检查消息是否匹配
-	if expectedGroupID != "" && queueMsg.GroupID != expectedGroupID {
-		// 消息不匹配当前消费组，重新放入队列
-		return bus.conn.LPush(ctx, fmt.Sprintf("%s:group:%s", queueMsg.Topic, queueMsg.GroupID), msgData).Err()
+	msgHeader, msgHeaderOK := queueMsg["header"]
+	if !msgHeaderOK {
+		return fmt.Errorf("message header not found")
+	}
+	msgValue, msgValueOK := queueMsg["value"]
+	if !msgValueOK {
+		return fmt.Errorf("message value not found")
 	}
 
-	bus.options.Logger.Debugf(ctx, "subscribe queue msg data: %s", msgData)
-
-	// 构造消息对象
-	msg := &Message{
-		Header: queueMsg.Header,
-		Value:  queueMsg.Value,
+	m := Message{
+		Header: make(MessageHeader),
+	}
+	if err = bus.options.Serialize.Unmarshal([]byte(msgHeader.(string)), &m.Header); err != nil {
+		return
 	}
 
-	// 如果Value是map类型，保持数据结构一致性
-	if valueMap, ok := queueMsg.Value.(map[string]interface{}); ok {
-		// 这里我们保持Value为原始的interface{}类型，让消费者自己处理类型转换
-		msg.Value = valueMap
+	bus.options.Logger.Debugf(ctx, "subscribe queue msg data: %s", msgValue)
+	if err = bus.options.Serialize.Unmarshal([]byte(msgValue.(string)), &m.Value); err != nil {
+		return
 	}
 
 	// 调用处理器
-	err = h(ctx, msg)
+	err = h(ctx, &m)
 	return
 }
 
