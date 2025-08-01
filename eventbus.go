@@ -29,3 +29,10 @@ type EventBus interface {
 	Publisher
 	Subscriber
 }
+
+// Closer 定义了可以关闭资源的接口
+// 某些 EventBus 实现（如 RabbitMQ）需要清理内部资源（如连接池）
+// 可以通过类型断言使用此接口: if closer, ok := bus.(eventbus.Closer); ok { closer.Close() }
+type Closer interface {
+	Close() error
+}

@@ -6,7 +6,9 @@ import (
 	"net/http"
 	_ "net/http/pprof"
 	"os"
+	"os/signal"
 	"runtime"
+	"syscall"
 	"time"
 
 	"github.com/isayme/go-amqp-reconnect/rabbitmq"
@@ -216,6 +218,35 @@ func main() {
 
 	for {
 		fmt.Printf("PID: %d, GroutineCount: %d, Channel OK\n", os.Getpid(), runtime.NumGoroutine())
-		time.Sleep(time.Second)
+
+		// 监听系统信号，优雅关闭
+		sigChan := make(chan os.Signal, 1)
+		signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+
+		select {
+		case <-sigChan:
+			fmt.Println("\n收到关闭信号，正在优雅关闭...")
+
+			// 通过类型断言调用 Close 方法
+			if closer, ok := bus.(interface{ Close() error }); ok {
+				if err := closer.Close(); err != nil {
+					fmt.Printf("关闭事件总线失败: %v\n", err)
+				} else {
+					fmt.Println("事件总线已关闭")
+				}
+			}
+
+			// 关闭连接
+			if err := conn.Close(); err != nil {
+				fmt.Printf("关闭连接失败: %v\n", err)
+			} else {
+				fmt.Println("连接已关闭")
+			}
+
+			fmt.Println("程序退出")
+			return
+		case <-time.After(time.Second):
+			// 继续循环
+		}
 	}
 }

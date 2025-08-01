@@ -73,15 +73,31 @@ type rabbitMQEventBus struct {
 	channelPool pool.Pooler
 }
 
-func (bus *rabbitMQEventBus) getChannel(ctx context.Context) (ch *rabbitmq.Channel, err error) {
+// Close 关闭事件总线，清理资源
+// 此方法不在 EventBus 接口中，需要通过类型断言调用
+func (bus *rabbitMQEventBus) Close() error {
+	if bus.channelPool != nil {
+		// 关闭连接池，这会自动关闭池中的所有资源
+		err := bus.channelPool.Shutdown()
+		if err != nil {
+			return fmt.Errorf("failed to shutdown channel pool: %w", err)
+		}
+	}
+	return nil
+}
+
+func (bus *rabbitMQEventBus) getChannel(_ context.Context) (ch *rabbitmq.Channel, err error) {
 	var v io.Closer
 	v, err = bus.channelPool.Get()
 	if err != nil {
 		return
 	}
-	ok := false
+	var ok bool
 	if ch, ok = v.(*rabbitmq.Channel); !ok {
+		// 类型断言失败时，需要将资源放回池中
+		bus.channelPool.Put(v)
 		err = ErrRabbitMQChannelNotFound
+		return
 	}
 	return
 }
@@ -258,6 +274,10 @@ func (bus *rabbitMQEventBus) handleSubMessage(ctx context.Context, msgs <-chan a
 		select {
 		case msg := <-msgs:
 			if len(msg.Body) == 0 {
+				// 空消息需要确认，避免重复投递
+				if ackErr := msg.Ack(false); ackErr != nil {
+					bus.options.Logger.Errorf(ctx, "failed to ack empty message: %v", ackErr)
+				}
 				continue
 			}
 			m := Message{
@@ -273,16 +293,20 @@ func (bus *rabbitMQEventBus) handleSubMessage(ctx context.Context, msgs <-chan a
 			}
 			if err = h(ctx, &m); err == nil {
 				if err = msg.Ack(false); err != nil {
+					bus.options.Logger.Errorf(ctx, "failed to ack message: %v", err)
 					return
 				}
 			} else {
-				if err = msg.Nack(false, true); err != nil {
+				bus.options.Logger.Errorf(ctx, "message handler error: %v", err)
+				if nackErr := msg.Nack(false, true); nackErr != nil {
+					bus.options.Logger.Errorf(ctx, "failed to nack message: %v", nackErr)
 					return
 				}
-				return
+				// 继续处理下一条消息，而不是返回错误中断订阅
 			}
 		case <-ctx.Done():
-			return
+			bus.options.Logger.Debugf(ctx, "subscription context cancelled")
+			return ctx.Err()
 		}
 	}
 }

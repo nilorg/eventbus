@@ -11,6 +11,17 @@ type EventBus interface {
 }
 ```
 
+### Closer
+
+```go
+// Closer 定义了可以关闭资源的接口
+// 某些 EventBus 实现（如 RabbitMQ）需要清理内部资源（如连接池）
+// 可以通过类型断言使用此接口: if closer, ok := bus.(eventbus.Closer); ok { closer.Close() }
+type Closer interface {
+    Close() error
+}
+```
+
 ### Publisher
 
 ```go
@@ -262,6 +273,27 @@ func main() {
     // 等待处理完成
     time.Sleep(5 * time.Second)
 }
+```
+
+### 资源清理
+
+```go
+// 创建事件总线
+bus, err := eventbus.NewRabbitMQ(conn)
+if err != nil {
+    log.Fatal(err)
+}
+
+// 使用 defer 确保资源清理
+defer func() {
+    if closer, ok := bus.(eventbus.Closer); ok {
+        if err := closer.Close(); err != nil {
+            log.Printf("关闭事件总线失败: %v", err)
+        }
+    }
+}()
+
+// 使用事件总线...
 ```
 
 ### 错误处理
