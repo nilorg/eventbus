@@ -3,6 +3,7 @@ package eventbus
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/go-redis/redis/v8"
@@ -11,17 +12,31 @@ import (
 var (
 	// DefaultRedisQueueOptions 默认Redis Queue可选项
 	DefaultRedisQueueOptions = RedisQueueOptions{
-		PollInterval: time.Second,
-		Serialize:    &JSONSerialize{},
-		Logger:       &StdLogger{},
+		PollInterval:      time.Second,
+		Serialize:         &JSONSerialize{},
+		Logger:            &StdLogger{},
+		MaxRetries:        3,
+		RetryInterval:     time.Second * 5,
+		BackoffMultiplier: 2.0,
+		MaxBackoff:        time.Minute * 5,
+		MessageMaxRetries: 3,    // 单条消息默认重试3次
+		SkipBadMessages:   true, // 默认跳过无法处理的消息
+		DeadLetterTopic:   "",   // 默认不使用死信队列
 	}
 )
 
 // RedisQueueOptions Redis Queue可选项
 type RedisQueueOptions struct {
-	PollInterval time.Duration // 轮询间隔
-	Serialize    Serializer
-	Logger       Logger
+	PollInterval      time.Duration // 轮询间隔
+	Serialize         Serializer
+	Logger            Logger
+	MaxRetries        int           // 最大重试次数
+	RetryInterval     time.Duration // 重试间隔
+	BackoffMultiplier float64       // 退避倍数
+	MaxBackoff        time.Duration // 最大退避时间
+	MessageMaxRetries int           // 单条消息最大重试次数
+	SkipBadMessages   bool          // 是否跳过无法处理的消息
+	DeadLetterTopic   string        // 死信队列主题
 }
 
 // QueueMessage Redis队列消息结构
@@ -89,6 +104,8 @@ func (bus *redisQueueEventBus) publish(ctx context.Context, topic string, v inte
 			}
 		}
 	}
+	// 自动添加 topic 到消息头
+	msg.Header["topic"] = topic
 
 	// 根据是否有GroupID来决定队列名称
 	queueName := topic
@@ -166,6 +183,12 @@ func (bus *redisQueueEventBus) subscribe(ctx context.Context, topic string, h Su
 }
 
 func (bus *redisQueueEventBus) consumeQueue(ctx context.Context, queueName string, h SubscribeHandler) (err error) {
+	retryCount := 0
+	baseRetryInterval := bus.options.RetryInterval
+	if baseRetryInterval <= 0 {
+		baseRetryInterval = time.Second * 5
+	}
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -179,25 +202,43 @@ func (bus *redisQueueEventBus) consumeQueue(ctx context.Context, queueName strin
 					// 没有消息，继续轮询
 					continue
 				}
+
 				bus.options.Logger.Errorf(ctx, "BRPop from queue %s error: %v", queueName, err)
-				// 遇到错误时，短暂休眠后继续
-				select {
-				case <-ctx.Done():
-					return ctx.Err()
-				case <-time.After(time.Second):
-					continue
+
+				// 检查是否为网络错误或连接错误
+				if bus.isRetryableError(err) && retryCount < bus.options.MaxRetries {
+					retryCount++
+					retryInterval := bus.calculateBackoff(baseRetryInterval, retryCount)
+					bus.options.Logger.Warnf(ctx, "Redis queue connection error, retrying %d/%d after %v: %v",
+						retryCount, bus.options.MaxRetries, retryInterval, err)
+
+					// 使用 context 来控制重试等待时间
+					select {
+					case <-ctx.Done():
+						return ctx.Err()
+					case <-time.After(retryInterval):
+						continue
+					}
 				}
+
+				// 如果不是可重试的错误，或者重试次数已达上限，直接返回
+				return err
 			}
+
+			// 成功读取数据，重置重试计数
+			retryCount = 0
 
 			if len(result) != 2 {
 				continue
 			}
 
 			msgData := result[1]
-			if err = bus.handleQueueMessage(ctx, msgData, h); err != nil {
-				bus.options.Logger.Errorf(ctx, "handle queue message error: %v", err)
-				// 处理消息失败，继续处理下一条消息
-				continue
+			if err = bus.handleQueueMessageWithRetry(ctx, queueName, msgData, h); err != nil {
+				bus.options.Logger.Errorf(ctx, "message processing failed after retries: %v", err)
+				// 根据配置决定是否继续处理其他消息
+				if !bus.options.SkipBadMessages {
+					return err
+				}
 			}
 		}
 	}
@@ -267,4 +308,123 @@ func (bus *redisQueueEventBus) GetQueueLength(ctx context.Context, queueName str
 // PeekQueue 查看队列中的消息而不移除
 func (bus *redisQueueEventBus) PeekQueue(ctx context.Context, queueName string, start, stop int64) (messages []string, err error) {
 	return bus.conn.LRange(ctx, queueName, start, stop).Result()
+}
+
+// isRetryableError 判断错误是否可以重试
+func (bus *redisQueueEventBus) isRetryableError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	errorStr := strings.ToLower(err.Error())
+	// 检查常见的网络错误和连接错误
+	return strings.Contains(errorStr, "timeout") ||
+		strings.Contains(errorStr, "connection refused") ||
+		strings.Contains(errorStr, "connection reset") ||
+		strings.Contains(errorStr, "no route to host") ||
+		strings.Contains(errorStr, "network is unreachable") ||
+		strings.Contains(errorStr, "broken pipe") ||
+		strings.Contains(errorStr, "connection lost")
+}
+
+// calculateBackoff 计算退避时间
+func (bus *redisQueueEventBus) calculateBackoff(baseInterval time.Duration, retryCount int) time.Duration {
+	multiplier := bus.options.BackoffMultiplier
+	if multiplier <= 0 {
+		multiplier = 2.0
+	}
+
+	maxBackoff := bus.options.MaxBackoff
+	if maxBackoff <= 0 {
+		maxBackoff = time.Minute * 5
+	}
+
+	// 指数退避：baseInterval * multiplier^retryCount
+	power := 1.0
+	for i := 0; i < retryCount; i++ {
+		power *= multiplier
+	}
+
+	newInterval := time.Duration(float64(baseInterval) * power)
+
+	// 限制最大退避时间
+	if newInterval > maxBackoff {
+		newInterval = maxBackoff
+	}
+
+	return newInterval
+}
+
+// handleQueueMessageWithRetry 带重试的消息处理
+func (bus *redisQueueEventBus) handleQueueMessageWithRetry(ctx context.Context, queueName, msgData string, h SubscribeHandler) (err error) {
+	maxRetries := bus.options.MessageMaxRetries
+	if maxRetries <= 0 {
+		maxRetries = 1 // 至少尝试一次
+	}
+
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		err = bus.handleQueueMessage(ctx, msgData, h)
+		if err == nil {
+			// 处理成功，返回
+			return nil
+		}
+
+		// 记录重试信息
+		if attempt < maxRetries {
+			bus.options.Logger.Warnf(ctx, "queue message processing failed (attempt %d/%d), retrying: %v",
+				attempt+1, maxRetries+1, err)
+
+			// 短暂等待后重试
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(time.Millisecond * 100): // 100ms 重试间隔
+				continue
+			}
+		}
+	}
+
+	// 所有重试都失败了
+	bus.options.Logger.Errorf(ctx, "queue message processing failed after %d attempts: %v", maxRetries+1, err)
+
+	// 如果配置了死信队列，将消息发送到死信队列
+	if bus.options.DeadLetterTopic != "" {
+		if dlErr := bus.sendToDeadLetterQueue(ctx, queueName, msgData); dlErr != nil {
+			bus.options.Logger.Errorf(ctx, "failed to send message to dead letter queue: %v", dlErr)
+		} else {
+			bus.options.Logger.Infof(ctx, "message sent to dead letter queue")
+			return nil // 不返回错误，因为消息已经处理（发送到DLQ）
+		}
+	}
+
+	return err
+}
+
+// sendToDeadLetterQueue 发送消息到死信队列
+func (bus *redisQueueEventBus) sendToDeadLetterQueue(ctx context.Context, originalQueue, msgData string) error {
+	if bus.options.DeadLetterTopic == "" {
+		return fmt.Errorf("dead letter topic not configured")
+	}
+
+	// 解析原始消息以获取更多信息
+	var queueMsg map[string]interface{}
+	_ = bus.options.Serialize.Unmarshal([]byte(msgData), &queueMsg)
+
+	// 构造死信消息，保持与 Redis Stream 一致的格式
+	dlqMessage := map[string]interface{}{
+		"original_id":     fmt.Sprintf("queue_%d", time.Now().UnixNano()), // 生成唯一ID
+		"original_topic":  originalQueue,                                  // 使用 original_topic
+		"original_values": queueMsg,                                       // 保持字段名一致
+		"failed_at":       time.Now().Unix(),
+		"error_reason":    "message processing failed after retries", // 保持错误信息一致
+	}
+
+	var dlqMsgData []byte
+	var err error
+	dlqMsgData, err = bus.options.Serialize.Marshal(dlqMessage)
+	if err != nil {
+		return err
+	}
+
+	return bus.conn.LPush(ctx, bus.options.DeadLetterTopic, string(dlqMsgData)).Err()
 }

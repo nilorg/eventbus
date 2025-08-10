@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
+	"time"
 
 	"github.com/isayme/go-amqp-reconnect/rabbitmq"
 	"github.com/nilorg/sdk/pool"
@@ -14,6 +16,10 @@ import (
 var (
 	// ErrRabbitMQChannelNotFound ...
 	ErrRabbitMQChannelNotFound = errors.New("rabbitmq channel not found")
+)
+
+const (
+	DefaultRabbitMQDeadLetterExchange = "nilorg.eventbus.dlx"
 )
 
 var (
@@ -26,6 +32,13 @@ var (
 		Logger:              &StdLogger{},
 		PoolMinOpen:         1,
 		PoolMaxOpen:         10,
+		MaxRetries:          3,
+		RetryInterval:       time.Second * 2,
+		BackoffMultiplier:   2.0,
+		MaxBackoff:          time.Minute,
+		MessageMaxRetries:   2,
+		SkipBadMessages:     true,
+		DeadLetterExchange:  "", // 默认不使用死信队列，由用户根据需要配置
 	}
 )
 
@@ -37,6 +50,19 @@ type RabbitMQOptions struct {
 	Serialize                Serializer
 	Logger                   Logger
 	PoolMinOpen, PoolMaxOpen int
+
+	// 重试机制配置
+	MaxRetries        int           // 连接重试次数
+	RetryInterval     time.Duration // 重试间隔
+	BackoffMultiplier float64       // 指数退避倍数
+	MaxBackoff        time.Duration // 最大退避时间
+
+	// 消息级重试配置
+	MessageMaxRetries int  // 消息最大重试次数
+	SkipBadMessages   bool // 是否跳过无法处理的消息
+
+	// 死信队列配置
+	DeadLetterExchange string // 死信交换机名称
 }
 
 // NewRabbitMQ 创建RabbitMQ事件总线
@@ -63,6 +89,11 @@ func NewRabbitMQ(conn *rabbitmq.Connection, options ...*RabbitMQOptions) (bus Ev
 	if err != nil {
 		return
 	}
+	// 设置死信交换机
+	err = rbus.setupDeadLetterExchange(context.Background())
+	if err != nil {
+		return
+	}
 	bus = rbus
 	return
 }
@@ -84,6 +115,125 @@ func (bus *rabbitMQEventBus) Close() error {
 		}
 	}
 	return nil
+}
+
+// executeWithRetry 执行带重试的操作
+func (bus *rabbitMQEventBus) executeWithRetry(ctx context.Context, operation func() error) error {
+	var lastErr error
+
+	for attempt := 0; attempt <= bus.options.MaxRetries; attempt++ {
+		if attempt > 0 {
+			// 计算指数退避时间
+			backoff := time.Duration(float64(bus.options.RetryInterval) *
+				math.Pow(bus.options.BackoffMultiplier, float64(attempt-1)))
+			if backoff > bus.options.MaxBackoff {
+				backoff = bus.options.MaxBackoff
+			}
+
+			bus.options.Logger.Debugf(ctx, "retrying operation (attempt %d/%d) after %v",
+				attempt+1, bus.options.MaxRetries+1, backoff)
+
+			select {
+			case <-time.After(backoff):
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+
+		if err := operation(); err != nil {
+			lastErr = err
+			bus.options.Logger.Errorf(ctx, "operation failed (attempt %d/%d): %v",
+				attempt+1, bus.options.MaxRetries+1, err)
+			continue
+		}
+
+		return nil
+	}
+
+	return fmt.Errorf("operation failed after %d attempts: %w", bus.options.MaxRetries+1, lastErr)
+}
+
+// setupDeadLetterExchange 设置死信交换机
+func (bus *rabbitMQEventBus) setupDeadLetterExchange(ctx context.Context) error {
+	if bus.options.DeadLetterExchange == "" {
+		return nil
+	}
+
+	return bus.executeWithRetry(ctx, func() error {
+		ch, err := bus.getChannel(ctx)
+		if err != nil {
+			return err
+		}
+		defer bus.putChannel(ch)
+
+		// 声明死信交换机
+		return ch.ExchangeDeclare(
+			bus.options.DeadLetterExchange,
+			"topic",
+			true,  // 持久
+			false, // 自动删除
+			false, // 内部
+			false, // 无等待
+			nil,
+		)
+	})
+}
+
+// sendToDeadLetter 发送消息到死信队列
+func (bus *rabbitMQEventBus) sendToDeadLetter(ctx context.Context, originalTopic string, msg *Message, errorReason string) {
+	if bus.options.DeadLetterExchange == "" {
+		return
+	}
+
+	// 创建死信消息（统一格式）
+	originalID := msg.Header["message_id"]
+	if originalID == "" {
+		// 如果没有 message_id，生成一个唯一 ID
+		originalID = fmt.Sprintf("rabbitmq_%d", time.Now().UnixNano())
+	}
+
+	dlqMessage := map[string]interface{}{
+		"original_id":     originalID,
+		"original_topic":  originalTopic,
+		"original_values": msg.Value, // 使用 original_values 保持与 Redis 一致
+		"failed_at":       time.Now().Unix(),
+		"error_reason":    errorReason, // 使用实际的错误信息
+	}
+
+	err := bus.executeWithRetry(ctx, func() error {
+		ch, err := bus.getChannel(ctx)
+		if err != nil {
+			return err
+		}
+		defer bus.putChannel(ch)
+
+		data, err := bus.options.Serialize.Marshal(dlqMessage)
+		if err != nil {
+			return err
+		}
+
+		return ch.Publish(
+			bus.options.DeadLetterExchange,
+			fmt.Sprintf("%s.failed", originalTopic),
+			false, // 强制
+			false, // 立即
+			amqp.Publishing{
+				ContentType: bus.options.Serialize.ContentType(),
+				Body:        data,
+				Headers: amqp.Table{
+					"x-original-topic": originalTopic,
+					"x-failed-at":      time.Now().Format(time.RFC3339),
+					"x-error-reason":   errorReason,
+				},
+			},
+		)
+	})
+
+	if err != nil {
+		bus.options.Logger.Errorf(ctx, "failed to send message to dead letter queue: %v", err)
+	} else {
+		bus.options.Logger.Debugf(ctx, "sent failed message to dead letter queue: %s.failed", originalTopic)
+	}
 }
 
 func (bus *rabbitMQEventBus) getChannel(_ context.Context) (ch *rabbitmq.Channel, err error) {
@@ -166,6 +316,10 @@ func (bus *rabbitMQEventBus) publish(ctx context.Context, topic string, v interf
 			Value:  v,
 		}
 	}
+
+	// 自动注入 topic 到消息头
+	msg.Header["topic"] = topic
+
 	// set message header
 	if f, ok := FromSetMessageHeaderContext(ctx); ok {
 		if headers := f(ctx); headers != nil {
@@ -174,33 +328,38 @@ func (bus *rabbitMQEventBus) publish(ctx context.Context, topic string, v interf
 			}
 		}
 	}
+
 	var data []byte
 	data, err = bus.options.Serialize.Marshal(msg.Value)
 	if err != nil {
 		return
 	}
 	bus.options.Logger.Debugf(ctx, "publish msg data: %s", string(data))
-	var ch *rabbitmq.Channel
-	if ch, err = bus.getChannel(ctx); err != nil {
-		return
-	}
-	defer bus.putChannel(ch)
 
-	headers := make(amqp.Table)
-	for k, v := range msg.Header {
-		headers[k] = v
-	}
-	err = ch.Publish(
-		bus.options.ExchangeName, //交换
-		topic,                    //路由密钥
-		!async,                   //强制
-		false,                    //立即
-		amqp.Publishing{
-			Headers:     headers,
-			ContentType: bus.options.Serialize.ContentType(),
-			Body:        data,
-		})
-	return
+	// 使用重试机制发布消息
+	return bus.executeWithRetry(ctx, func() error {
+		ch, err := bus.getChannel(ctx)
+		if err != nil {
+			return err
+		}
+		defer bus.putChannel(ch)
+
+		headers := make(amqp.Table)
+		for k, v := range msg.Header {
+			headers[k] = v
+		}
+
+		return ch.Publish(
+			bus.options.ExchangeName, //交换
+			topic,                    //路由密钥
+			!async,                   //强制
+			false,                    //立即
+			amqp.Publishing{
+				Headers:     headers,
+				ContentType: bus.options.Serialize.ContentType(),
+				Body:        data,
+			})
+	})
 }
 
 func (bus *rabbitMQEventBus) Subscribe(ctx context.Context, topic string, h SubscribeHandler) (err error) {
@@ -280,6 +439,7 @@ func (bus *rabbitMQEventBus) handleSubMessage(ctx context.Context, msgs <-chan a
 				}
 				continue
 			}
+
 			m := Message{
 				Header: make(MessageHeader),
 			}
@@ -288,21 +448,79 @@ func (bus *rabbitMQEventBus) handleSubMessage(ctx context.Context, msgs <-chan a
 			}
 
 			bus.options.Logger.Debugf(ctx, "subscribe msg data: %s", string(msg.Body))
-			if err = bus.options.Serialize.Unmarshal(msg.Body, &m.Value); err != nil {
-				return
+
+			// 反序列化消息
+			if unmarshalErr := bus.options.Serialize.Unmarshal(msg.Body, &m.Value); unmarshalErr != nil {
+				bus.options.Logger.Errorf(ctx, "failed to unmarshal message: %v", unmarshalErr)
+				if bus.options.SkipBadMessages {
+					// 跳过无法反序列化的消息
+					if ackErr := msg.Ack(false); ackErr != nil {
+						bus.options.Logger.Errorf(ctx, "failed to ack bad message: %v", ackErr)
+					}
+					continue
+				}
+				return unmarshalErr
 			}
-			if err = h(ctx, &m); err == nil {
-				if err = msg.Ack(false); err != nil {
-					bus.options.Logger.Errorf(ctx, "failed to ack message: %v", err)
-					return
+
+			// 获取原始topic
+			originalTopic := msg.RoutingKey
+			if topicFromHeader, exists := m.Header["topic"]; exists {
+				originalTopic = topicFromHeader
+			}
+
+			// 获取重试次数
+			retryCount := 0
+			if retryHeader, exists := m.Header["x-retry-count"]; exists {
+				if count, parseErr := fmt.Sscanf(retryHeader, "%d", &retryCount); parseErr != nil || count != 1 {
+					retryCount = 0
+				}
+			}
+
+			// 处理消息
+			handlerErr := h(ctx, &m)
+
+			if handlerErr == nil {
+				// 成功处理，确认消息
+				if ackErr := msg.Ack(false); ackErr != nil {
+					bus.options.Logger.Errorf(ctx, "failed to ack message: %v", ackErr)
+					if !bus.options.SkipBadMessages {
+						return ackErr
+					}
 				}
 			} else {
-				bus.options.Logger.Errorf(ctx, "message handler error: %v", err)
-				if nackErr := msg.Nack(false, true); nackErr != nil {
-					bus.options.Logger.Errorf(ctx, "failed to nack message: %v", nackErr)
-					return
+				bus.options.Logger.Errorf(ctx, "message handler error: %v", handlerErr)
+
+				// 检查是否可以重试
+				if retryCount < bus.options.MessageMaxRetries {
+					// 增加重试次数并重新入队
+					m.Header["x-retry-count"] = fmt.Sprintf("%d", retryCount+1)
+					bus.options.Logger.Debugf(ctx, "requeuing message for retry %d/%d", retryCount+1, bus.options.MessageMaxRetries)
+
+					if nackErr := msg.Nack(false, true); nackErr != nil {
+						bus.options.Logger.Errorf(ctx, "failed to nack message for retry: %v", nackErr)
+						if !bus.options.SkipBadMessages {
+							return nackErr
+						}
+					}
+				} else {
+					// 达到最大重试次数，发送到死信队列
+					bus.options.Logger.Errorf(ctx, "message exceeded max retries (%d), sending to dead letter queue", bus.options.MessageMaxRetries)
+					bus.sendToDeadLetter(ctx, originalTopic, &m, handlerErr.Error())
+
+					// 确认消息（避免重复处理）
+					if ackErr := msg.Ack(false); ackErr != nil {
+						bus.options.Logger.Errorf(ctx, "failed to ack failed message: %v", ackErr)
+						if !bus.options.SkipBadMessages {
+							return ackErr
+						}
+					}
 				}
+
 				// 继续处理下一条消息，而不是返回错误中断订阅
+				if !bus.options.SkipBadMessages && retryCount >= bus.options.MessageMaxRetries {
+					// 如果不跳过坏消息且已达到最大重试次数，则中断订阅
+					return handlerErr
+				}
 			}
 		case <-ctx.Done():
 			bus.options.Logger.Debugf(ctx, "subscription context cancelled")
