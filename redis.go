@@ -20,9 +20,11 @@ var (
 		RetryInterval:     time.Second * 5,
 		BackoffMultiplier: 2.0,
 		MaxBackoff:        time.Minute * 5,
-		MessageMaxRetries: 3,    // 单条消息默认重试3次
-		SkipBadMessages:   true, // 默认跳过无法处理的消息
-		DeadLetterTopic:   "",   // 默认不使用死信队列
+		MessageMaxRetries: 3,                  // 单条消息默认重试3次
+		SkipBadMessages:   true,               // 默认跳过无法处理的消息
+		DeadLetterTopic:   "",                 // 默认不使用死信队列
+		DeadLetterMaxLen:  1000,               // 死信队列最大长度
+		DeadLetterTTL:     time.Hour * 24 * 7, // 死信消息保留7天
 	}
 )
 
@@ -39,6 +41,8 @@ type RedisOptions struct {
 	MessageMaxRetries int           // 单条消息最大重试次数
 	SkipBadMessages   bool          // 是否跳过无法处理的消息
 	DeadLetterTopic   string        // 死信队列主题
+	DeadLetterMaxLen  int64         // 死信队列最大长度
+	DeadLetterTTL     time.Duration // 死信消息TTL
 }
 
 type redisEventBus struct {
@@ -346,17 +350,77 @@ func (bus *redisEventBus) sendToDeadLetter(ctx context.Context, originalTopic st
 		return fmt.Errorf("dead letter topic not configured")
 	}
 
-	// 构造死信消息，包含原始消息和错误信息
-	dlqMessage := map[string]interface{}{
-		"original_id":     msg.ID,
-		"original_topic":  originalTopic,
-		"original_values": msg.Values,
-		"failed_at":       time.Now().Unix(),
-		"error_reason":    "message processing failed after retries",
+	// 将Redis消息转换为EventBus消息格式
+	originalMsg := &Message{
+		Header: MessageHeader{
+			"message_id": msg.ID,
+			"topic":      originalTopic,
+		},
+		Value: msg.Values,
 	}
 
-	return bus.conn.XAdd(ctx, &redis.XAddArgs{
+	// 尝试从消息值中提取原始的header和value
+	if headerData, headerOK := msg.Values["header"]; headerOK {
+		if headerStr, isString := headerData.(string); isString {
+			var header MessageHeader
+			if err := bus.options.Serialize.Unmarshal([]byte(headerStr), &header); err == nil {
+				// 成功解析header，合并到消息中
+				for k, v := range header {
+					originalMsg.Header[k] = v
+				}
+			}
+		}
+	}
+
+	if valueData, valueOK := msg.Values["value"]; valueOK {
+		if valueStr, isString := valueData.(string); isString {
+			var value interface{}
+			if err := bus.options.Serialize.Unmarshal([]byte(valueStr), &value); err == nil {
+				originalMsg.Value = value
+			}
+		}
+	}
+
+	// 使用统一的死信消息创建函数
+	dlqMsg := CreateDeadLetterMessage(originalTopic, originalMsg, "message processing failed after retries", bus.options.DeadLetterTopic, "redis")
+
+	// 将死信消息序列化为JSON字符串，然后作为单个值存储
+	dlqData, err := bus.options.Serialize.Marshal(dlqMsg)
+	if err != nil {
+		bus.options.Logger.Errorf(ctx, "failed to marshal dead letter message: %v", err)
+		return err
+	}
+
+	// 使用统一的格式存储死信消息，并设置长度限制
+	dlqValues := map[string]interface{}{
+		"dead_letter_message": string(dlqData),
+		"timestamp":           time.Now().Unix(),
+		"source":              "redis-stream",
+	}
+
+	addArgs := &redis.XAddArgs{
 		Stream: bus.options.DeadLetterTopic,
-		Values: dlqMessage,
-	}).Err()
+		Values: dlqValues,
+	}
+
+	// 设置死信队列最大长度
+	if bus.options.DeadLetterMaxLen > 0 {
+		addArgs.MaxLen = bus.options.DeadLetterMaxLen
+		addArgs.Approx = true // 使用近似修剪提高性能
+	}
+
+	if err := bus.conn.XAdd(ctx, addArgs).Err(); err != nil {
+		bus.options.Logger.Errorf(ctx, "failed to send message to dead letter stream: %v", err)
+		return err
+	}
+
+	// 如果配置了TTL，设置过期时间
+	if bus.options.DeadLetterTTL > 0 {
+		if err := bus.conn.Expire(ctx, bus.options.DeadLetterTopic, bus.options.DeadLetterTTL).Err(); err != nil {
+			bus.options.Logger.Warnf(ctx, "failed to set TTL for dead letter stream: %v", err)
+		}
+	}
+
+	bus.options.Logger.Infof(ctx, "message sent to dead letter stream %s", bus.options.DeadLetterTopic)
+	return nil
 }

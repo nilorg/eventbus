@@ -19,9 +19,11 @@ var (
 		RetryInterval:     time.Second * 5,
 		BackoffMultiplier: 2.0,
 		MaxBackoff:        time.Minute * 5,
-		MessageMaxRetries: 3,    // 单条消息默认重试3次
-		SkipBadMessages:   true, // 默认跳过无法处理的消息
-		DeadLetterTopic:   "",   // 默认不使用死信队列
+		MessageMaxRetries: 3,                  // 单条消息默认重试3次
+		SkipBadMessages:   true,               // 默认跳过无法处理的消息
+		DeadLetterTopic:   "",                 // 默认不使用死信队列
+		DeadLetterMaxLen:  1000,               // 死信队列最大长度
+		DeadLetterTTL:     time.Hour * 24 * 7, // 死信消息保留7天
 	}
 )
 
@@ -37,6 +39,8 @@ type RedisQueueOptions struct {
 	MessageMaxRetries int           // 单条消息最大重试次数
 	SkipBadMessages   bool          // 是否跳过无法处理的消息
 	DeadLetterTopic   string        // 死信队列主题
+	DeadLetterMaxLen  int64         // 死信队列最大长度
+	DeadLetterTTL     time.Duration // 死信消息TTL
 }
 
 // QueueMessage Redis队列消息结构
@@ -408,23 +412,79 @@ func (bus *redisQueueEventBus) sendToDeadLetterQueue(ctx context.Context, origin
 
 	// 解析原始消息以获取更多信息
 	var queueMsg map[string]interface{}
-	_ = bus.options.Serialize.Unmarshal([]byte(msgData), &queueMsg)
-
-	// 构造死信消息，保持与 Redis Stream 一致的格式
-	dlqMessage := map[string]interface{}{
-		"original_id":     fmt.Sprintf("queue_%d", time.Now().UnixNano()), // 生成唯一ID
-		"original_topic":  originalQueue,                                  // 使用 original_topic
-		"original_values": queueMsg,                                       // 保持字段名一致
-		"failed_at":       time.Now().Unix(),
-		"error_reason":    "message processing failed after retries", // 保持错误信息一致
+	if err := bus.options.Serialize.Unmarshal([]byte(msgData), &queueMsg); err != nil {
+		bus.options.Logger.Errorf(ctx, "failed to unmarshal message for dead letter queue: %v", err)
+		// 如果无法解析原始消息，创建简单的死信消息
+		queueMsg = map[string]interface{}{
+			"raw_data": msgData,
+		}
 	}
 
+	// 尝试解析消息内容
+	var originalMsg *Message
+	if header, headerOK := queueMsg["header"]; headerOK {
+		if value, valueOK := queueMsg["value"]; valueOK {
+			originalMsg = &Message{
+				Header: make(MessageHeader),
+			}
+
+			// 解析header
+			if err := bus.options.Serialize.Unmarshal([]byte(header.(string)), &originalMsg.Header); err != nil {
+				bus.options.Logger.Warnf(ctx, "failed to unmarshal header for dead letter: %v", err)
+				originalMsg.Header = MessageHeader{"topic": originalQueue}
+			}
+
+			// 解析value
+			if err := bus.options.Serialize.Unmarshal([]byte(value.(string)), &originalMsg.Value); err != nil {
+				bus.options.Logger.Warnf(ctx, "failed to unmarshal value for dead letter: %v", err)
+				originalMsg.Value = value
+			}
+		}
+	}
+
+	// 如果无法解析为Message格式，创建简单的消息
+	if originalMsg == nil {
+		originalMsg = &Message{
+			Header: MessageHeader{
+				"topic":    originalQueue,
+				"raw_data": "true",
+			},
+			Value: queueMsg,
+		}
+	}
+
+	// 使用统一的死信消息创建函数
+	dlqMsg := CreateDeadLetterMessage(originalQueue, originalMsg, "message processing failed after retries", bus.options.DeadLetterTopic, "redis-queue")
+
+	// 序列化死信消息
 	var dlqMsgData []byte
 	var err error
-	dlqMsgData, err = bus.options.Serialize.Marshal(dlqMessage)
+	dlqMsgData, err = bus.options.Serialize.Marshal(dlqMsg)
 	if err != nil {
+		bus.options.Logger.Errorf(ctx, "failed to marshal dead letter message: %v", err)
 		return err
 	}
 
-	return bus.conn.LPush(ctx, bus.options.DeadLetterTopic, string(dlqMsgData)).Err()
+	// 发送到死信队列
+	if err := bus.conn.LPush(ctx, bus.options.DeadLetterTopic, string(dlqMsgData)).Err(); err != nil {
+		bus.options.Logger.Errorf(ctx, "failed to send message to dead letter queue: %v", err)
+		return err
+	}
+
+	// 限制死信队列长度
+	if bus.options.DeadLetterMaxLen > 0 {
+		if err := bus.conn.LTrim(ctx, bus.options.DeadLetterTopic, 0, bus.options.DeadLetterMaxLen-1).Err(); err != nil {
+			bus.options.Logger.Warnf(ctx, "failed to trim dead letter queue: %v", err)
+		}
+	}
+
+	// 如果配置了TTL，设置过期时间
+	if bus.options.DeadLetterTTL > 0 {
+		if err := bus.conn.Expire(ctx, bus.options.DeadLetterTopic, bus.options.DeadLetterTTL).Err(); err != nil {
+			bus.options.Logger.Warnf(ctx, "failed to set TTL for dead letter queue: %v", err)
+		}
+	}
+
+	bus.options.Logger.Infof(ctx, "message sent to dead letter queue %s", bus.options.DeadLetterTopic)
+	return nil
 }

@@ -328,3 +328,254 @@ options := &eventbus.RedisQueueOptions{
     PollInterval: 100 * time.Millisecond, // 降低延迟
 }
 ```
+
+## NATS 实现
+
+### NewNATS
+
+创建基于NATS Core的事件总线，适用于高性能、低延迟的实时通信场景。
+
+```go
+func NewNATS(conn *nats.Conn, options ...*NATSOptions) (bus EventBus, err error)
+```
+
+**参数：**
+- `conn`: NATS连接实例
+- `options`: 可选配置参数
+
+**示例：**
+
+```go
+// 连接NATS服务器
+nc, err := nats.Connect("nats://localhost:4222")
+if err != nil {
+    return err
+}
+
+// 创建事件总线
+bus, err := eventbus.NewNATS(nc)
+if err != nil {
+    return err
+}
+
+// 发布消息
+err = bus.Publish(ctx, "user.created", userData)
+
+// 订阅消息
+err = bus.SubscribeAsync(ctx, "user.*", func(ctx context.Context, msg *eventbus.Message) error {
+    // 处理消息
+    return nil
+})
+```
+
+### NewNATSJetStream
+
+创建基于NATS JetStream的事件总线，支持消息持久化、确认机制，适用于可靠性要求高的场景。
+
+```go
+func NewNATSJetStream(conn *nats.Conn, options ...*NATSJetStreamOptions) (bus EventBus, err error)
+```
+
+**参数：**
+- `conn`: NATS连接实例（需要支持JetStream）
+- `options`: JetStream配置参数
+
+**示例：**
+
+```go
+// 连接NATS服务器
+nc, err := nats.Connect("nats://localhost:4222")
+if err != nil {
+    return err
+}
+
+// 配置JetStream选项
+options := eventbus.DefaultNATSJetStreamOptions
+options.StreamName = "ORDERS"
+options.MaxMsgs = 10000
+options.MaxAge = 24 * time.Hour
+
+// 创建JetStream事件总线
+bus, err := eventbus.NewNATSJetStream(nc, &options)
+if err != nil {
+    return err
+}
+
+// 发布消息（会被持久化）
+err = bus.Publish(ctx, "order.created", orderData)
+
+// 队列组订阅（负载均衡）
+groupCtx := eventbus.NewGroupIDContext(ctx, "order-processors")
+err = bus.SubscribeAsync(groupCtx, "order.*", func(ctx context.Context, msg *eventbus.Message) error {
+    // 处理订单事件
+    return nil
+})
+```
+
+### NATSOptions
+
+NATS Core配置选项。
+
+```go
+type NATSOptions struct {
+    Serialize         Serializer    // 序列化器，默认JSON
+    Logger            Logger        // 日志器
+    MaxRetries        int           // 发布重试次数，默认3
+    RetryInterval     time.Duration // 重试间隔，默认2秒
+    BackoffMultiplier float64       // 退避倍数，默认2.0
+    MaxBackoff        time.Duration // 最大退避时间，默认1分钟
+    MessageMaxRetries int           // 消息处理重试次数，默认3
+    SkipBadMessages   bool          // 跳过无法序列化的消息，默认true
+    DeadLetterSubject string        // 死信队列主题
+    QueueGroup        string        // 默认队列组名
+}
+```
+
+### NATSJetStreamOptions
+
+NATS JetStream配置选项，继承NATSOptions的所有配置。
+
+```go
+type NATSJetStreamOptions struct {
+    // 基础选项（继承自NATSOptions）
+    Serialize         Serializer
+    Logger            Logger
+    MaxRetries        int
+    RetryInterval     time.Duration
+    BackoffMultiplier float64
+    MaxBackoff        time.Duration
+    MessageMaxRetries int
+    SkipBadMessages   bool
+    DeadLetterSubject string
+    QueueGroup        string
+    
+    // JetStream特有配置
+    StreamName      string        // 流名称，默认"EVENTBUS"
+    MaxMsgs         int64         // 流最大消息数，默认1000000
+    MaxAge          time.Duration // 消息最大保存时间，默认24小时
+    DuplicateWindow time.Duration // 去重窗口，默认2分钟
+    Replicas        int           // 副本数，默认1
+    AckWait         time.Duration // 确认等待时间，默认30秒
+    MaxDeliver      int           // 最大投递次数，默认3
+}
+```
+
+### 队列组支持
+
+NATS实现支持队列组功能，实现消费者负载均衡：
+
+```go
+// 创建队列组上下文
+groupCtx := eventbus.NewGroupIDContext(ctx, "my-service-group")
+
+// 同一队列组的多个消费者会进行负载均衡
+err = bus.SubscribeAsync(groupCtx, "events.*", handler1) // 消费者1
+err = bus.SubscribeAsync(groupCtx, "events.*", handler2) // 消费者2
+
+// 不同队列组的消费者会收到所有消息
+otherGroupCtx := eventbus.NewGroupIDContext(ctx, "other-service-group")
+err = bus.SubscribeAsync(otherGroupCtx, "events.*", handler3) // 独立消费者
+```
+
+### 主题匹配
+
+NATS支持主题通配符：
+
+```go
+// 精确匹配
+bus.Subscribe(ctx, "user.created", handler)
+
+// 单级通配符 *
+bus.Subscribe(ctx, "user.*", handler) // 匹配 user.created, user.updated 等
+
+// 多级通配符 >
+bus.Subscribe(ctx, "events.>", handler) // 匹配 events.user.created, events.order.paid 等
+```
+
+### 消息头支持
+
+```go
+// 设置消息头
+headerCtx := eventbus.NewSetMessageHeaderContext(ctx, func(ctx context.Context) eventbus.MessageHeader {
+    return eventbus.MessageHeader{
+        "message-id": generateUniqueID(),
+        "source":     "user-service",
+        "timestamp":  fmt.Sprintf("%d", time.Now().Unix()),
+    }
+})
+
+// 发布带头信息的消息
+err = bus.Publish(headerCtx, "user.created", userData)
+```
+
+### 错误处理和重试
+
+NATS实现提供多层次的错误处理：
+
+1. **发布重试**：发布失败时自动重试
+2. **消息处理重试**：消息处理失败时重试
+3. **死信队列**：重试失败的消息发送到死信队列
+
+```go
+options := eventbus.NATSOptions{
+    MaxRetries:        5,                    // 发布重试5次
+    RetryInterval:     time.Second,          // 初始重试间隔1秒
+    BackoffMultiplier: 1.5,                  // 每次重试间隔增加50%
+    MaxBackoff:        time.Minute,          // 最大重试间隔1分钟
+    MessageMaxRetries: 3,                    // 消息处理重试3次
+    DeadLetterSubject: "failed.messages",    // 死信队列
+}
+```
+
+### JetStream特性
+
+JetStream提供的额外特性：
+
+**消息持久化**：
+```go
+// 消息会被持久化到磁盘，服务重启后仍可消费
+err = bus.Publish(ctx, "important.event", data)
+```
+
+**消息确认**：
+```go
+// 消息处理成功后自动确认，失败时会重新投递
+err = bus.SubscribeAsync(ctx, "events.*", func(ctx context.Context, msg *eventbus.Message) error {
+    if err := processMessage(msg); err != nil {
+        return err // 返回错误，消息会重新投递
+    }
+    return nil // 返回nil，消息被确认
+})
+```
+
+**去重机制**：
+```go
+// 使用消息ID实现去重
+headerCtx := eventbus.NewSetMessageHeaderContext(ctx, func(ctx context.Context) eventbus.MessageHeader {
+    return eventbus.MessageHeader{
+        "message-id": "unique-id-123", // 相同ID的消息会被去重
+    }
+})
+```
+
+### 性能优化
+
+```go
+// 1. 使用异步模式提高吞吐量
+bus.PublishAsync(ctx, topic, data)
+bus.SubscribeAsync(ctx, topic, handler)
+
+// 2. 合理配置JetStream参数
+options := &eventbus.NATSJetStreamOptions{
+    MaxMsgs:     100000,             // 根据业务调整流大小
+    MaxAge:      time.Hour,          // 消息保留时间
+    AckWait:     10 * time.Second,   // 确认等待时间
+    MaxDeliver:  5,                  // 最大投递次数
+}
+
+// 3. 使用队列组实现水平扩展
+groupCtx := eventbus.NewGroupIDContext(ctx, "worker-group")
+for i := 0; i < workerCount; i++ {
+    bus.SubscribeAsync(groupCtx, "work.tasks", processTask)
+}
+```

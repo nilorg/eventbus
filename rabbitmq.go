@@ -185,20 +185,7 @@ func (bus *rabbitMQEventBus) sendToDeadLetter(ctx context.Context, originalTopic
 		return
 	}
 
-	// 创建死信消息（统一格式）
-	originalID := msg.Header["message_id"]
-	if originalID == "" {
-		// 如果没有 message_id，生成一个唯一 ID
-		originalID = fmt.Sprintf("rabbitmq_%d", time.Now().UnixNano())
-	}
-
-	dlqMessage := map[string]interface{}{
-		"original_id":     originalID,
-		"original_topic":  originalTopic,
-		"original_values": msg.Value, // 使用 original_values 保持与 Redis 一致
-		"failed_at":       time.Now().Unix(),
-		"error_reason":    errorReason, // 使用实际的错误信息
-	}
+	dlqMsg := CreateDeadLetterMessage(originalTopic, msg, errorReason, bus.options.DeadLetterExchange, "rabbitmq")
 
 	err := bus.executeWithRetry(ctx, func() error {
 		ch, err := bus.getChannel(ctx)
@@ -207,9 +194,15 @@ func (bus *rabbitMQEventBus) sendToDeadLetter(ctx context.Context, originalTopic
 		}
 		defer bus.putChannel(ch)
 
-		data, err := bus.options.Serialize.Marshal(dlqMessage)
+		data, err := bus.options.Serialize.Marshal(dlqMsg)
 		if err != nil {
 			return err
+		}
+
+		// 创建AMQP头信息
+		headers := make(amqp.Table)
+		for k, v := range dlqMsg.Header {
+			headers[k] = v
 		}
 
 		return ch.Publish(
@@ -220,11 +213,7 @@ func (bus *rabbitMQEventBus) sendToDeadLetter(ctx context.Context, originalTopic
 			amqp.Publishing{
 				ContentType: bus.options.Serialize.ContentType(),
 				Body:        data,
-				Headers: amqp.Table{
-					"x-original-topic": originalTopic,
-					"x-failed-at":      time.Now().Format(time.RFC3339),
-					"x-error-reason":   errorReason,
-				},
+				Headers:     headers,
 			},
 		)
 	})
