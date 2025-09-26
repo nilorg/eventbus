@@ -25,6 +25,9 @@ var (
 		DeadLetterTopic:   "",                 // 默认不使用死信队列
 		DeadLetterMaxLen:  1000,               // 死信队列最大长度
 		DeadLetterTTL:     time.Hour * 24 * 7, // 死信消息保留7天
+		StreamTrimMaxLen:  10000,              // 主动裁剪时保留的最大长度
+		StreamTrimApprox:  true,               // 使用近似裁剪以提升性能
+		StreamTrimLimit:   100,                // 近似裁剪时的限制参数
 	}
 )
 
@@ -43,6 +46,9 @@ type RedisOptions struct {
 	DeadLetterTopic   string        // 死信队列主题
 	DeadLetterMaxLen  int64         // 死信队列最大长度
 	DeadLetterTTL     time.Duration // 死信消息TTL
+	StreamTrimMaxLen  int64         // Stream 主动裁剪时保留的最大长度，<=0 表示不裁剪
+	StreamTrimApprox  bool          // Stream 裁剪时是否使用近似模式
+	StreamTrimLimit   int64         // Stream 近似裁剪时使用的 LIMIT 参数，<=0 表示不设置
 }
 
 type redisEventBus struct {
@@ -153,6 +159,66 @@ func (bus *redisEventBus) subscribe(ctx context.Context, topic string, h Subscri
 	}
 	err = bus.xReadGroup(ctx, topic, queueName, consumer, h)
 	return
+}
+
+func (bus *redisEventBus) CleanupStream(ctx context.Context, stream string) error {
+	if bus == nil || bus.conn == nil {
+		return errors.New("redisEventBus: redis client is nil")
+	}
+
+	var logger Logger
+	if bus.options != nil && bus.options.Logger != nil {
+		logger = bus.options.Logger
+	}
+
+	maxLen := bus.options.StreamTrimMaxLen
+	if maxLen <= 0 {
+		if logger != nil {
+			logger.Debugf(ctx, "stream %s cleanup skipped: trim max len disabled", stream)
+		}
+		return nil
+	}
+
+	var trimCmd *redis.IntCmd
+	if bus.options.StreamTrimApprox {
+		limit := bus.options.StreamTrimLimit
+		if limit > 0 {
+			trimCmd = bus.conn.XTrimMaxLenApprox(ctx, stream, maxLen, limit)
+		} else {
+			trimCmd = bus.conn.XTrimMaxLen(ctx, stream, maxLen)
+		}
+	} else {
+		trimCmd = bus.conn.XTrimMaxLen(ctx, stream, maxLen)
+	}
+
+	trimmed, err := trimCmd.Result()
+	if err != nil {
+		if errors.Is(err, redis.Nil) || isRedisNoStreamError(err) {
+			if logger != nil {
+				logger.Infof(ctx, "redis stream %s not found, skip trim", stream)
+			}
+			return nil
+		}
+		if logger != nil {
+			logger.Errorf(ctx, "failed to trim stream %s: %v", stream, err)
+		}
+		return err
+	}
+
+	if logger != nil {
+		logger.Infof(ctx, "redis stream %s trimmed to max len %d, removed %d entries", stream, maxLen, trimmed)
+	}
+	return nil
+}
+
+func isRedisNoStreamError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "no such key") ||
+		strings.Contains(msg, "stream not found") ||
+		strings.Contains(msg, "key not found")
 }
 
 func (bus *redisEventBus) xReadGroup(ctx context.Context, stream, group, consumer string, h SubscribeHandler) (err error) {

@@ -36,3 +36,10 @@ type EventBus interface {
 type Closer interface {
 	Close() error
 }
+
+// StreamCleaner 定义了可以清理流资源的接口
+// 某些基于流的 EventBus 实现（如 Redis Stream）需要手动清理 Stream 或消费组
+// 可以通过类型断言使用此接口: if cleaner, ok := bus.(eventbus.StreamCleaner); ok { cleaner.CleanupStream(ctx, topic) }
+type StreamCleaner interface {
+	CleanupStream(ctx context.Context, stream string) error
+}
