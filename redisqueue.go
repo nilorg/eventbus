@@ -111,13 +111,6 @@ func (bus *redisQueueEventBus) publish(ctx context.Context, topic string, v inte
 	// 自动添加 topic 到消息头
 	msg.Header["topic"] = topic
 
-	// 根据是否有GroupID来决定队列名称
-	queueName := topic
-	if gid, ok := FromGroupIDContext(ctx); ok {
-		// 为了支持消费组，发布到特定消费组的队列
-		queueName = fmt.Sprintf("%s:group:%s", topic, gid)
-	}
-
 	var msgHeader []byte
 	msgHeader, err = bus.options.Serialize.Marshal(msg.Header)
 	if err != nil {
@@ -142,18 +135,24 @@ func (bus *redisQueueEventBus) publish(ctx context.Context, topic string, v inte
 		return
 	}
 
+	push := func(targetQueue string) error {
+		if err := bus.conn.LPush(ctx, targetQueue, string(queueMsgData)).Err(); err != nil {
+			bus.options.Logger.Errorf(ctx, "publish to queue %s error: %v", targetQueue, err)
+			return err
+		}
+		return nil
+	}
+
 	if async {
-		go func() {
-			// 异步发布到Redis List
-			if asyncErr := bus.conn.LPush(ctx, queueName, string(queueMsgData)).Err(); asyncErr != nil {
-				bus.options.Logger.Errorf(ctx, "async publish to queue %s error: %v", queueName, asyncErr)
+		go func(queue string) {
+			if asyncErr := push(queue); asyncErr != nil {
+				bus.options.Logger.Errorf(ctx, "async publish error: %v", asyncErr)
 			}
-		}()
+		}(topic)
 		return
 	}
 
-	// 同步发布到Redis List
-	err = bus.conn.LPush(ctx, queueName, string(queueMsgData)).Err()
+	err = push(topic)
 	return
 }
 
@@ -166,12 +165,7 @@ func (bus *redisQueueEventBus) SubscribeAsync(ctx context.Context, topic string,
 }
 
 func (bus *redisQueueEventBus) subscribe(ctx context.Context, topic string, h SubscribeHandler, async bool) (err error) {
-	// 根据是否有GroupID来决定队列名称
 	queueName := topic
-	if gid, ok := FromGroupIDContext(ctx); ok {
-		// 为了支持消费组，我们使用不同的队列名称
-		queueName = fmt.Sprintf("%s:group:%s", topic, gid)
-	}
 
 	if async {
 		go func(subCtx context.Context) {
