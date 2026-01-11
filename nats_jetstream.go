@@ -3,31 +3,45 @@ package eventbus
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/nats-io/nats.go"
 )
 
+// nats.go 官方默认常量（未导出的常量需要在此定义）
+const (
+	// defaultAsyncPubAckInflight 是 nats.go 官方的异步发布最大待处理数默认值
+	// 参考: https://github.com/nats-io/nats.go/blob/main/js.go
+	defaultAsyncPubAckInflight = 4000
+
+	// defaultAPITimeout 是 nats.go 官方的 JetStream API 默认超时时间
+	// 参考: https://github.com/nats-io/nats.go/blob/main/jetstream/jetstream.go
+	defaultAPITimeout = 5 * time.Second
+)
+
 var (
 	// DefaultNATSJetStreamOptions 默认NATS JetStream可选项
 	DefaultNATSJetStreamOptions = NATSJetStreamOptions{
-		Serialize:         &JSONSerialize{},
-		Logger:            &StdLogger{},
-		MaxRetries:        3,
-		RetryInterval:     time.Second * 2,
-		BackoffMultiplier: 2.0,
-		MaxBackoff:        time.Minute,
-		MessageMaxRetries: 3,
-		SkipBadMessages:   true,
-		DeadLetterSubject: "",
-		QueueGroup:        "",
-		StreamName:        "EVENTBUS",
-		MaxMsgs:           1000000,
-		MaxAge:            24 * time.Hour,
-		DuplicateWindow:   2 * time.Minute,
-		Replicas:          1,
-		AckWait:           30 * time.Second,
-		MaxDeliver:        3,
+		Serialize:              &JSONSerialize{},
+		Logger:                 &StdLogger{},
+		MaxRetries:             nats.DefaultPubRetryAttempts, // 官方默认值: 2
+		RetryInterval:          nats.DefaultPubRetryWait,     // 官方默认值: 250ms
+		BackoffMultiplier:      2.0,
+		MaxBackoff:             time.Minute,
+		MessageMaxRetries:      nats.DefaultPubRetryAttempts, // 官方默认值: 2
+		SkipBadMessages:        true,
+		DeadLetterSubject:      "",
+		QueueGroup:             "",
+		StreamName:             "EVENTBUS",
+		MaxMsgs:                1000000,
+		MaxAge:                 24 * time.Hour,
+		DuplicateWindow:        2 * time.Minute,
+		Replicas:               1,
+		AckWait:                defaultAPITimeout,          // 官方默认值: 5s
+		MaxDeliver:             -1,                         // 官方服务器默认值: -1 (无限)
+		MaxWaiting:             512,                        // NATS JetStream 服务器默认值
+		PublishAsyncMaxPending: defaultAsyncPubAckInflight, // 官方默认值: 4000
 	}
 )
 
@@ -45,13 +59,15 @@ type NATSJetStreamOptions struct {
 	QueueGroup        string        // 队列组名，用于负载均衡
 
 	// JetStream 特有配置
-	StreamName      string        // 流名称
-	MaxMsgs         int64         // 流中最大消息数
-	MaxAge          time.Duration // 消息最大保存时间
-	DuplicateWindow time.Duration // 重复消息检测窗口
-	Replicas        int           // 副本数
-	AckWait         time.Duration // 消息确认等待时间
-	MaxDeliver      int           // 最大投递次数
+	StreamName             string        // 流名称
+	MaxMsgs                int64         // 流中最大消息数
+	MaxAge                 time.Duration // 消息最大保存时间
+	DuplicateWindow        time.Duration // 重复消息检测窗口
+	Replicas               int           // 副本数
+	AckWait                time.Duration // 消息确认等待时间
+	MaxDeliver             int           // 最大投递次数
+	MaxWaiting             int           // Pull消费者最大等待请求数
+	PublishAsyncMaxPending int           // 异步发布最大待处理数
 }
 
 type natsJetStreamEventBus struct {
@@ -74,7 +90,11 @@ func NewNATSJetStream(conn *nats.Conn, options ...*NATSJetStreamOptions) (bus Ev
 	}
 
 	// 创建JetStream上下文
-	js, err := conn.JetStream()
+	jsOpts := []nats.JSOpt{
+		nats.MaxWait(opts.AckWait),                               // 设置API请求的默认超时时间
+		nats.PublishAsyncMaxPending(opts.PublishAsyncMaxPending), // 设置异步发布最大待处理数
+	}
+	js, err := conn.JetStream(jsOpts...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create JetStream context: %w", err)
 	}
@@ -300,6 +320,7 @@ func (n *natsJetStreamEventBus) subscribe(ctx context.Context, topic string, h S
 			MaxDeliver:    n.options.MaxDeliver,
 			FilterSubject: jsSubject,
 			DeliverGroup:  effectiveGroup,
+			MaxWaiting:    n.options.MaxWaiting,
 		}
 
 		// 确保消费者存在
@@ -346,6 +367,9 @@ func (n *natsJetStreamEventBus) subscribe(ctx context.Context, topic string, h S
 
 // pullMessages Pull订阅的消息拉取循环
 func (n *natsJetStreamEventBus) pullMessages(ctx context.Context, sub *nats.Subscription, handler nats.MsgHandler) {
+	backoff := time.Millisecond * 100
+	maxBackoff := time.Second * 5
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -355,13 +379,30 @@ func (n *natsJetStreamEventBus) pullMessages(ctx context.Context, sub *nats.Subs
 			msgs, err := sub.Fetch(10, nats.MaxWait(time.Second))
 			if err != nil {
 				if err == nats.ErrTimeout {
-					continue // 超时是正常的，继续拉取
+					backoff = time.Millisecond * 100 // 重置退避时间
+					continue                         // 超时是正常的，继续拉取
+				}
+				// 处理 Exceeded MaxWaiting 错误，使用指数退避
+				if strings.Contains(err.Error(), "Exceeded MaxWaiting") {
+					n.options.Logger.Debugf(ctx, "Exceeded MaxWaiting, backing off for %v", backoff)
+					select {
+					case <-ctx.Done():
+						return
+					case <-time.After(backoff):
+						// 指数退避
+						backoff = backoff * 2
+						if backoff > maxBackoff {
+							backoff = maxBackoff
+						}
+					}
+					continue
 				}
 				n.options.Logger.Errorf(ctx, "Failed to fetch messages: %v", err)
 				time.Sleep(time.Second)
 				continue
 			}
 
+			backoff = time.Millisecond * 100 // 成功获取消息后重置退避时间
 			for _, msg := range msgs {
 				handler(msg)
 			}
