@@ -195,11 +195,12 @@ func (bus *rabbitMQEventBus) republishForRetry(ctx context.Context, originalMsg 
 		}
 		headers["x-retry-count"] = retryCount
 
+		// 使用配置的交换机（originalMsg.Exchange 消费时可能为空）
 		return ch.Publish(
-			originalMsg.Exchange,   // 使用原始交换机
-			originalMsg.RoutingKey, // 使用原始路由键
-			false,                  // 强制
-			false,                  // 立即
+			bus.options.ExchangeName, // 使用配置的交换机
+			originalMsg.RoutingKey,   // 使用原始路由键
+			false,                    // 强制
+			false,                    // 立即
 			amqp.Publishing{
 				Headers:         headers,
 				ContentType:     originalMsg.ContentType,
@@ -498,11 +499,18 @@ func (bus *rabbitMQEventBus) handleSubMessage(ctx context.Context, msgs <-chan a
 				originalTopic = topicFromHeader
 			}
 
-			// 获取重试次数
+			// 获取重试次数（从原始 headers 获取，类型可能是 int 或 string）
 			retryCount := 0
-			if retryHeader, exists := m.Header["x-retry-count"]; exists {
-				if count, parseErr := fmt.Sscanf(retryHeader, "%d", &retryCount); parseErr != nil || count != 1 {
-					retryCount = 0
+			if retryVal, exists := msg.Headers["x-retry-count"]; exists {
+				switch v := retryVal.(type) {
+				case int:
+					retryCount = v
+				case int64:
+					retryCount = int(v)
+				case int32:
+					retryCount = int(v)
+				case string:
+					fmt.Sscanf(v, "%d", &retryCount)
 				}
 			}
 
