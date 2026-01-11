@@ -179,6 +179,47 @@ func (bus *rabbitMQEventBus) setupDeadLetterExchange(ctx context.Context) error 
 	})
 }
 
+// republishForRetry 重新发布消息用于重试（带有更新后的 retry count）
+func (bus *rabbitMQEventBus) republishForRetry(ctx context.Context, originalMsg amqp.Delivery, retryCount int) error {
+	return bus.executeWithRetry(ctx, func() error {
+		ch, err := bus.getChannel(ctx)
+		if err != nil {
+			return err
+		}
+		defer bus.putChannel(ch)
+
+		// 复制原始 headers 并更新 retry count
+		headers := make(amqp.Table)
+		for k, v := range originalMsg.Headers {
+			headers[k] = v
+		}
+		headers["x-retry-count"] = retryCount
+
+		return ch.Publish(
+			originalMsg.Exchange,   // 使用原始交换机
+			originalMsg.RoutingKey, // 使用原始路由键
+			false,                  // 强制
+			false,                  // 立即
+			amqp.Publishing{
+				Headers:         headers,
+				ContentType:     originalMsg.ContentType,
+				ContentEncoding: originalMsg.ContentEncoding,
+				DeliveryMode:    originalMsg.DeliveryMode,
+				Priority:        originalMsg.Priority,
+				CorrelationId:   originalMsg.CorrelationId,
+				ReplyTo:         originalMsg.ReplyTo,
+				Expiration:      originalMsg.Expiration,
+				MessageId:       originalMsg.MessageId,
+				Timestamp:       originalMsg.Timestamp,
+				Type:            originalMsg.Type,
+				UserId:          originalMsg.UserId,
+				AppId:           originalMsg.AppId,
+				Body:            originalMsg.Body,
+			},
+		)
+	})
+}
+
 // sendToDeadLetter 发送消息到死信队列
 func (bus *rabbitMQEventBus) sendToDeadLetter(ctx context.Context, originalTopic string, msg *Message, errorReason string) {
 	if bus.options.DeadLetterExchange == "" {
@@ -481,15 +522,24 @@ func (bus *rabbitMQEventBus) handleSubMessage(ctx context.Context, msgs <-chan a
 
 				// 检查是否可以重试
 				if retryCount < bus.options.MessageMaxRetries {
-					// 增加重试次数并重新入队
-					m.Header["x-retry-count"] = fmt.Sprintf("%d", retryCount+1)
-					bus.options.Logger.Debugf(ctx, "requeuing message for retry %d/%d", retryCount+1, bus.options.MessageMaxRetries)
+					// 增加重试次数并重新发布消息
+					newRetryCount := retryCount + 1
+					bus.options.Logger.Debugf(ctx, "republishing message for retry %d/%d", newRetryCount, bus.options.MessageMaxRetries)
 
-					if nackErr := msg.Nack(false, true); nackErr != nil {
-						bus.options.Logger.Errorf(ctx, "failed to nack message for retry: %v", nackErr)
+					// 先确认原消息
+					if ackErr := msg.Ack(false); ackErr != nil {
+						bus.options.Logger.Errorf(ctx, "failed to ack message before retry: %v", ackErr)
 						if !bus.options.SkipBadMessages {
-							return nackErr
+							return ackErr
 						}
+						continue
+					}
+
+					// 重新发布带有更新后 retry count 的消息
+					if republishErr := bus.republishForRetry(ctx, msg, newRetryCount); republishErr != nil {
+						bus.options.Logger.Errorf(ctx, "failed to republish message for retry: %v", republishErr)
+						// 发送到死信队列
+						bus.sendToDeadLetter(ctx, originalTopic, &m, fmt.Sprintf("republish failed: %v, original error: %v", republishErr, handlerErr))
 					}
 				} else {
 					// 达到最大重试次数，发送到死信队列
