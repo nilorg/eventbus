@@ -147,6 +147,69 @@ func (n *natsJetStreamEventBus) ensureStream() error {
 	return nil
 }
 
+// ensureConsumer 确保消费者存在并更新可变配置
+func (n *natsJetStreamEventBus) ensureConsumer(ctx context.Context, consumerName string, config *nats.ConsumerConfig) error {
+	// 先尝试获取现有消费者信息
+	existingConsumer, err := n.js.ConsumerInfo(n.options.StreamName, consumerName)
+	if err != nil {
+		// 消费者不存在，创建新的
+		_, err = n.js.AddConsumer(n.options.StreamName, config)
+		if err != nil {
+			return fmt.Errorf("failed to create consumer %s: %w", consumerName, err)
+		}
+		n.options.Logger.Infof(ctx, "Created JetStream consumer: %s (MaxWaiting: %d)", consumerName, config.MaxWaiting)
+		return nil
+	}
+
+	// 消费者已存在，检查是否需要更新配置
+	needsUpdate := false
+	updateReasons := []string{}
+
+	// 检查可更新的配置项
+	if existingConsumer.Config.MaxWaiting != config.MaxWaiting {
+		needsUpdate = true
+		updateReasons = append(updateReasons, fmt.Sprintf("MaxWaiting: %d -> %d", existingConsumer.Config.MaxWaiting, config.MaxWaiting))
+	}
+	if existingConsumer.Config.AckWait != config.AckWait {
+		needsUpdate = true
+		updateReasons = append(updateReasons, fmt.Sprintf("AckWait: %v -> %v", existingConsumer.Config.AckWait, config.AckWait))
+	}
+	if existingConsumer.Config.MaxDeliver != config.MaxDeliver {
+		needsUpdate = true
+		updateReasons = append(updateReasons, fmt.Sprintf("MaxDeliver: %d -> %d", existingConsumer.Config.MaxDeliver, config.MaxDeliver))
+	}
+
+	if needsUpdate {
+		// 更新消费者配置
+		// 注意：某些配置在更新时不能改变，需要保留原有值
+		updateConfig := &nats.ConsumerConfig{
+			Durable:       config.Durable,
+			AckPolicy:     existingConsumer.Config.AckPolicy, // 不可变
+			AckWait:       config.AckWait,                    // 可更新
+			MaxDeliver:    config.MaxDeliver,                 // 可更新
+			FilterSubject: existingConsumer.Config.FilterSubject,
+			DeliverGroup:  existingConsumer.Config.DeliverGroup,
+			MaxWaiting:    config.MaxWaiting, // 可更新
+			// 保留其他不可变配置
+			DeliverSubject: existingConsumer.Config.DeliverSubject,
+			DeliverPolicy:  existingConsumer.Config.DeliverPolicy,
+			ReplayPolicy:   existingConsumer.Config.ReplayPolicy,
+		}
+
+		_, err = n.js.UpdateConsumer(n.options.StreamName, updateConfig)
+		if err != nil {
+			n.options.Logger.Warnf(ctx, "Failed to update consumer %s: %v (changes: %v)", consumerName, err, updateReasons)
+			// 更新失败不影响订阅，继续使用现有配置
+			return nil
+		}
+		n.options.Logger.Infof(ctx, "Updated JetStream consumer: %s (%s)", consumerName, strings.Join(updateReasons, ", "))
+	} else {
+		n.options.Logger.Debugf(ctx, "JetStream consumer %s already exists with correct config (MaxWaiting: %d)", consumerName, existingConsumer.Config.MaxWaiting)
+	}
+
+	return nil
+}
+
 // getJetStreamSubject 获取JetStream主题名
 func (n *natsJetStreamEventBus) getJetStreamSubject(topic string) string {
 	return fmt.Sprintf("%s.%s", n.options.StreamName, topic)
@@ -307,10 +370,13 @@ func (n *natsJetStreamEventBus) subscribe(ctx context.Context, topic string, h S
 
 	if hasGroup && groupID != "" || n.options.QueueGroup != "" {
 		// 使用JetStream Pull订阅实现队列组功能
+		// consumerName 需要包含 topic 信息，确保不同 topic 使用不同的 Consumer
 		consumerName := effectiveGroup
 		if consumerName == "" {
 			consumerName = "default-consumer"
 		}
+		// 添加 topic 到 consumerName，避免不同 topic 共用同一个 Consumer
+		consumerName = fmt.Sprintf("%s-%s", consumerName, topic)
 
 		// 创建或获取消费者
 		consumerConfig := &nats.ConsumerConfig{
@@ -323,14 +389,10 @@ func (n *natsJetStreamEventBus) subscribe(ctx context.Context, topic string, h S
 			MaxWaiting:    n.options.MaxWaiting,
 		}
 
-		// 确保消费者存在
-		_, err = n.js.AddConsumer(n.options.StreamName, consumerConfig)
+		// 确保消费者存在并更新配置
+		err = n.ensureConsumer(ctx, consumerName, consumerConfig)
 		if err != nil {
-			// 如果消费者已存在，尝试获取现有的
-			_, err = n.js.ConsumerInfo(n.options.StreamName, consumerName)
-			if err != nil {
-				return fmt.Errorf("failed to create or get consumer %s: %w", consumerName, err)
-			}
+			return fmt.Errorf("failed to ensure consumer %s: %w", consumerName, err)
 		}
 
 		// 创建Pull订阅
