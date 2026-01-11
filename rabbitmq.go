@@ -222,9 +222,10 @@ func (bus *rabbitMQEventBus) republishForRetry(ctx context.Context, originalMsg 
 }
 
 // sendToDeadLetter 发送消息到死信队列
-func (bus *rabbitMQEventBus) sendToDeadLetter(ctx context.Context, originalTopic string, msg *Message, errorReason string) {
+// 返回 error 用于调用方判断是否发送成功
+func (bus *rabbitMQEventBus) sendToDeadLetter(ctx context.Context, originalTopic string, msg *Message, errorReason string) error {
 	if bus.options.DeadLetterExchange == "" {
-		return
+		return nil
 	}
 
 	dlqMsg := CreateDeadLetterMessage(originalTopic, msg, errorReason, bus.options.DeadLetterExchange, "rabbitmq")
@@ -253,9 +254,10 @@ func (bus *rabbitMQEventBus) sendToDeadLetter(ctx context.Context, originalTopic
 			false, // 强制
 			false, // 立即
 			amqp.Publishing{
-				ContentType: bus.options.Serialize.ContentType(),
-				Body:        data,
-				Headers:     headers,
+				ContentType:  bus.options.Serialize.ContentType(),
+				Body:         data,
+				Headers:      headers,
+				DeliveryMode: amqp.Persistent, // 持久化死信消息
 			},
 		)
 	})
@@ -265,6 +267,7 @@ func (bus *rabbitMQEventBus) sendToDeadLetter(ctx context.Context, originalTopic
 	} else {
 		bus.options.Logger.Debugf(ctx, "sent failed message to dead letter queue: %s.failed", originalTopic)
 	}
+	return err
 }
 
 func (bus *rabbitMQEventBus) getChannel(_ context.Context) (ch *rabbitmq.Channel, err error) {
@@ -534,32 +537,42 @@ func (bus *rabbitMQEventBus) handleSubMessage(ctx context.Context, msgs <-chan a
 					newRetryCount := retryCount + 1
 					bus.options.Logger.Debugf(ctx, "republishing message for retry %d/%d", newRetryCount, bus.options.MessageMaxRetries)
 
-					// 先确认原消息
-					if ackErr := msg.Ack(false); ackErr != nil {
-						bus.options.Logger.Errorf(ctx, "failed to ack message before retry: %v", ackErr)
-						if !bus.options.SkipBadMessages {
-							return ackErr
+					// 先重新发布带有更新后 retry count 的消息（确保消息不丢失）
+					if republishErr := bus.republishForRetry(ctx, msg, newRetryCount); republishErr != nil {
+						bus.options.Logger.Errorf(ctx, "failed to republish message for retry: %v", republishErr)
+						// 发布失败，Nack 让 RabbitMQ 重新投递原消息
+						if nackErr := msg.Nack(false, true); nackErr != nil {
+							bus.options.Logger.Errorf(ctx, "failed to nack message after republish failure: %v", nackErr)
 						}
 						continue
 					}
 
-					// 重新发布带有更新后 retry count 的消息
-					if republishErr := bus.republishForRetry(ctx, msg, newRetryCount); republishErr != nil {
-						bus.options.Logger.Errorf(ctx, "failed to republish message for retry: %v", republishErr)
-						// 发送到死信队列
-						bus.sendToDeadLetter(ctx, originalTopic, &m, fmt.Sprintf("republish failed: %v, original error: %v", republishErr, handlerErr))
+					// 重新发布成功后，再确认原消息
+					if ackErr := msg.Ack(false); ackErr != nil {
+						bus.options.Logger.Errorf(ctx, "failed to ack message after republish: %v", ackErr)
+						// Ack 失败不影响流程，新消息已发布，原消息会被重新投递（可能导致重复处理）
 					}
 				} else {
 					// 达到最大重试次数，发送到死信队列
 					bus.options.Logger.Errorf(ctx, "message exceeded max retries (%d), sending to dead letter queue", bus.options.MessageMaxRetries)
-					bus.sendToDeadLetter(ctx, originalTopic, &m, handlerErr.Error())
 
-					// 确认消息（避免重复处理）
-					if ackErr := msg.Ack(false); ackErr != nil {
-						bus.options.Logger.Errorf(ctx, "failed to ack failed message: %v", ackErr)
-						if !bus.options.SkipBadMessages {
-							return ackErr
+					// 先发送到死信队列（保证消息不丢失）
+					if dlqErr := bus.sendToDeadLetter(ctx, originalTopic, &m, handlerErr.Error()); dlqErr != nil {
+						// 死信队列发送失败，不能直接 Ack，否则消息会丢失
+						// 使用 Nack 但不重新入队（requeue=false），让 RabbitMQ 的死信机制处理
+						// 或者如果没有配置 RabbitMQ 原生死信队列，则记录日志后 Ack（接受风险）
+						bus.options.Logger.Errorf(ctx, "CRITICAL: failed to send to dead letter queue, message may be lost: %v", dlqErr)
+						if nackErr := msg.Nack(false, false); nackErr != nil {
+							bus.options.Logger.Errorf(ctx, "failed to nack message: %v", nackErr)
 						}
+						continue
+					}
+
+					// 死信队列发送成功，再确认原消息
+					if ackErr := msg.Ack(false); ackErr != nil {
+						bus.options.Logger.Errorf(ctx, "failed to ack failed message after sending to DLQ: %v", ackErr)
+						// Ack 失败，消息已在死信队列，原消息可能被重复投递到死信队列
+						// 死信队列消费端需要做幂等处理
 					}
 				}
 
