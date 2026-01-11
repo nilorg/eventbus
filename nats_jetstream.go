@@ -89,6 +89,17 @@ func NewNATSJetStream(conn *nats.Conn, options ...*NATSJetStreamOptions) (bus Ev
 		opts = &DefaultNATSJetStreamOptions
 	}
 
+	// 参数校验和默认值填充
+	if opts.PublishAsyncMaxPending < 1 {
+		opts.PublishAsyncMaxPending = defaultAsyncPubAckInflight
+	}
+	if opts.AckWait <= 0 {
+		opts.AckWait = defaultAPITimeout
+	}
+	if opts.MaxWaiting < 1 {
+		opts.MaxWaiting = 512
+	}
+
 	// 创建JetStream上下文
 	jsOpts := []nats.JSOpt{
 		nats.MaxWait(opts.AckWait),                               // 设置API请求的默认超时时间
