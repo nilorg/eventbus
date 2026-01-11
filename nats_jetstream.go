@@ -226,6 +226,27 @@ func (n *natsJetStreamEventBus) getJetStreamSubject(topic string) string {
 	return fmt.Sprintf("%s.%s", n.options.StreamName, topic)
 }
 
+// sanitizeConsumerName 生成合法的 Consumer 名称
+// NATS Consumer 名称不能包含 '.', '>', '*', ' ' 等特殊字符
+func sanitizeConsumerName(group, topic string) string {
+	consumerName := group
+	if consumerName == "" {
+		consumerName = "default-consumer"
+	}
+
+	// 替换 topic 中的非法字符
+	safeTopic := topic
+	replacer := strings.NewReplacer(
+		".", "_",
+		">", "_",
+		"*", "_",
+		" ", "_",
+	)
+	safeTopic = replacer.Replace(safeTopic)
+
+	return fmt.Sprintf("%s_%s", consumerName, safeTopic)
+}
+
 // Publish 发布消息
 func (n *natsJetStreamEventBus) Publish(ctx context.Context, topic string, v interface{}) error {
 	return n.publishWithRetry(ctx, topic, v, false)
@@ -381,13 +402,7 @@ func (n *natsJetStreamEventBus) subscribe(ctx context.Context, topic string, h S
 
 	if hasGroup && groupID != "" || n.options.QueueGroup != "" {
 		// 使用JetStream Pull订阅实现队列组功能
-		// consumerName 需要包含 topic 信息，确保不同 topic 使用不同的 Consumer
-		consumerName := effectiveGroup
-		if consumerName == "" {
-			consumerName = "default-consumer"
-		}
-		// 添加 topic 到 consumerName，避免不同 topic 共用同一个 Consumer
-		consumerName = fmt.Sprintf("%s-%s", consumerName, topic)
+		consumerName := sanitizeConsumerName(effectiveGroup, topic)
 
 		// 创建或获取消费者
 		consumerConfig := &nats.ConsumerConfig{
