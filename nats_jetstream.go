@@ -197,7 +197,32 @@ func (n *natsJetStreamEventBus) ensureConsumer(ctx context.Context, streamName, 
 	// 先尝试获取现有消费者信息
 	existingConsumer, err := n.js.ConsumerInfo(streamName, consumerName)
 	if err != nil {
-		// 消费者不存在，创建新的
+		// 消费者不存在，检查是否有其他 Consumer 使用了相同的 FilterSubject（WorkQueue 限制）
+		streamInfo, err := n.js.StreamInfo(streamName)
+		if err != nil {
+			return fmt.Errorf("failed to get stream info for %s: %w", streamName, err)
+		}
+
+		// 检查是否是 WorkQueue 模式且有相同 FilterSubject 的 Consumer
+		if streamInfo.Config.Retention == nats.WorkQueuePolicy && config.FilterSubject != "" {
+			consumers := streamInfo.State.Consumers
+			if consumers > 0 {
+				// 列出所有 Consumer 检查是否有冲突
+				consumerNames := n.js.ConsumerNames(streamName)
+				for name := range consumerNames {
+					info, err := n.js.ConsumerInfo(streamName, name)
+					if err != nil {
+						continue
+					}
+					if info.Config.FilterSubject == config.FilterSubject && info.Config.Durable != consumerName {
+						return fmt.Errorf("consumer with FilterSubject %s already exists on WorkQueue stream %s (existing: %s, new: %s). WorkQueue streams only allow one consumer per FilterSubject",
+							config.FilterSubject, streamName, info.Config.Durable, consumerName)
+					}
+				}
+			}
+		}
+
+		// 创建新的消费者
 		_, err = n.js.AddConsumer(streamName, config)
 		if err != nil {
 			return fmt.Errorf("failed to create consumer %s on stream %s: %w", consumerName, streamName, err)
