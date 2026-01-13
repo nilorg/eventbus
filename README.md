@@ -159,19 +159,33 @@ func main() {
 ```go
 // 创建NATS JetStream事件总线，支持持久化
 options := &eventbus.NATSJetStreamOptions{
-    StreamName:    "USER_EVENTS",
-    Subjects:      []string{"user.>"},
-    Storage:       nats.FileStorage,
-    MaxMsgs:       1000000,
-    MaxBytes:      1024 * 1024 * 1024, // 1GB
-    MaxAge:        time.Hour * 24 * 7,  // 7天
-    Replicas:      1,
+    StreamName:          "MY_APP",
+    MaxMsgs:             1000000,
+    MaxAge:              time.Hour * 24 * 7,  // 7天
+    Replicas:            1,
+    DefaultDeliveryMode: eventbus.NATSJetStreamDeliveryModeWorkQueue, // 默认投递模式
 }
 
 bus, err := eventbus.NewNATSJetStream(nc, options)
 if err != nil {
     log.Fatal(err)
 }
+
+ctx := context.Background()
+topic := "user.events"
+
+// 发布消息（使用默认的 WorkQueue 模式）
+err = bus.Publish(ctx, topic, map[string]interface{}{
+    "user_id": 123,
+    "action":  "login",
+})
+
+// 订阅消息
+bus.Subscribe(ctx, topic, func(ctx context.Context, msg *eventbus.Message) error {
+    log.Printf("收到消息: %+v", msg.Value)
+    return nil
+})
+```
 
 #### RabbitMQ
 
@@ -268,6 +282,90 @@ bus.Subscribe(groupCtx, "order_events", handler)
 // 发布到特定消费组
 bus.Publish(groupCtx, "order_events", orderData)
 ```
+
+### NATS JetStream 投递模式
+
+NATS JetStream 支持三种投递模式，适用于不同的业务场景。
+
+> **重要说明**：投递模式通过 Context 指定，不同模式的消息存储在不同的 Stream 中，彼此完全隔离。
+> 
+> 例如，业务 Topic `user.events` 在不同模式下的实际 Subject：
+> - WorkQueue: `EVENTBUS.user.events`
+> - Broadcast: `EVENTBUS_BROADCAST.user.events`  
+> - Limits: `EVENTBUS_LIMITS.user.events`
+>
+> **发布者和订阅者必须使用相同的模式才能通信。**
+
+#### WorkQueue 模式（工作队列）
+
+消息只被一个消费者处理，适合任务分发场景。所有订阅者共享同一个 Consumer，实现负载均衡。
+
+```go
+// 配置默认使用 WorkQueue 模式
+options := &eventbus.NATSJetStreamOptions{
+    StreamName:          "TASKS",
+    DefaultDeliveryMode: eventbus.NATSJetStreamDeliveryModeWorkQueue,
+}
+
+bus, err := eventbus.NewNATSJetStream(nc, options)
+
+// 多个消费者订阅同一个主题，消息会被负载均衡分发
+// 消费者 A
+bus.Subscribe(ctx, "tasks.process", handlerA)
+// 消费者 B
+bus.Subscribe(ctx, "tasks.process", handlerB)
+
+// 发布任务，只会被 A 或 B 中的一个处理
+bus.Publish(ctx, "tasks.process", taskData)
+```
+
+#### Broadcast 模式（广播）
+
+所有 Group 都会收到消息，同一 Group 内负载均衡。适合事件通知、配置更新等场景。
+
+```go
+// 使用上下文指定 Broadcast 模式
+broadcastCtx := eventbus.WithNATSJetStreamDeliveryMode(ctx, eventbus.NATSJetStreamDeliveryModeBroadcast)
+
+// 服务 A 的实例 1 和 2（使用相同 Group，组内负载均衡）
+groupCtxA := eventbus.NewGroupIDContext(broadcastCtx, "service-a")
+bus.Subscribe(groupCtxA, "config.update", handlerA1) // 实例 1
+bus.Subscribe(groupCtxA, "config.update", handlerA2) // 实例 2
+
+// 服务 B 的实例（不同 Group，独立消费）
+groupCtxB := eventbus.NewGroupIDContext(broadcastCtx, "service-b")
+bus.Subscribe(groupCtxB, "config.update", handlerB)
+
+// 发布配置更新，服务 A 和服务 B 都会收到（各 Group 内负载均衡）
+bus.Publish(broadcastCtx, "config.update", configData)
+```
+
+#### Limits 模式（历史回溯）
+
+支持消息持久化和历史回放，适合事件溯源、审计日志等场景。
+
+```go
+// 使用上下文指定 Limits 模式
+limitsCtx := eventbus.WithNATSJetStreamDeliveryMode(ctx, eventbus.NATSJetStreamDeliveryModeLimits)
+
+// 有 Group 时组内负载均衡
+groupCtx := eventbus.NewGroupIDContext(limitsCtx, "audit-processor")
+bus.Subscribe(groupCtx, "audit.events", auditHandler)
+
+// 无 Group 时每个实例独立消费所有消息
+bus.Subscribe(limitsCtx, "audit.events", independentHandler)
+
+// 发布审计事件
+bus.Publish(limitsCtx, "audit.events", auditEvent)
+```
+
+#### 投递模式对比
+
+| 模式 | 消息分发 | Group 语义 | 适用场景 |
+|------|----------|-----------|----------|
+| **WorkQueue** | 每条消息只被一个消费者处理 | 忽略 Group | 任务分发、订单处理 |
+| **Broadcast** | 每个 Group 都收到消息 | 组内负载均衡 | 配置更新、事件通知 |
+| **Limits** | 支持历史回放 | 有 Group 则负载均衡 | 事件溯源、审计日志 |
 
 ### 消息头
 
@@ -406,15 +504,24 @@ bus, err := eventbus.NewNATS(nc, options)
 
 ```go
 options := &eventbus.NATSJetStreamOptions{
-    StreamName:        "MY_STREAM",         // 流名称
-    Subjects:          []string{"events.>"},// 主题模式
-    Description:       "Event stream",      // 流描述
-    Storage:           nats.FileStorage,    // 存储类型
+    // 流配置
+    StreamName:        "MY_STREAM",         // 流名称前缀（会根据模式自动添加后缀）
     MaxMsgs:           1000000,             // 最大消息数
-    MaxBytes:          1024 * 1024 * 1024,  // 最大字节数
     MaxAge:            time.Hour * 24 * 7,  // 消息最大保留时间
-    MaxMsgSize:        1024 * 1024,         // 单个消息最大大小
+    DuplicateWindow:   time.Minute * 2,     // 重复消息检测窗口
     Replicas:          1,                   // 副本数
+    
+    // 消费者配置
+    AckWait:           time.Second * 30,    // 消息确认等待时间
+    MaxDeliver:        -1,                  // 最大投递次数（-1 表示无限）
+    MaxWaiting:        512,                 // Pull 消费者最大等待请求数
+    
+    // 投递模式配置
+    DefaultDeliveryMode: eventbus.NATSJetStreamDeliveryModeWorkQueue, // 默认投递模式
+    InactiveThreshold:   time.Hour * 24,    // 消费者不活跃自动删除时间（仅 Broadcast 模式）
+    
+    // 异步发布配置
+    PublishAsyncMaxPending: 4000,           // 异步发布最大待处理数
     
     Serialize:         &eventbus.JSONSerialize{}, // 序列化器
     Logger:            &eventbus.StdLogger{},     // 日志器
@@ -462,11 +569,12 @@ bus, err := eventbus.NewRabbitMQ(conn, options)
 | 特性 | Redis Streams | Redis Queue | RabbitMQ | NATS Core | NATS JetStream |
 |------|--------------|-------------|----------|-----------|----------------|
 | 性能 | 高 | 很高 | 中等 | 很高 | 高 |
-| 功能丰富度 | 中等 | 简单 | 很高 | 中等 | 高 |
+| 功能丰富度 | 中等 | 简单 | 很高 | 中等 | 很高 |
 | 消息持久化 | ✅ | ❌ | ✅ | ❌ | ✅ |
 | 消息确认 | ✅ | ❌ | ✅ | ❌ | ✅ |
 | 消费组 | ✅ | ❌ | ✅ | ✅ | ✅ |
 | 历史回放 | ✅ | ❌ | ❌ | ❌ | ✅ |
+| 多投递模式 | ❌ | ❌ | ❌ | ❌ | ✅ |
 | 连接重试 | ✅ | ✅ | ✅ | ✅ | ✅ |
 | 消息重试 | ✅ | ✅ | ✅ | ✅ | ✅ |
 | 死信队列 | ✅ | ✅ | ✅ | ✅ | ✅ |
@@ -481,7 +589,7 @@ bus, err := eventbus.NewRabbitMQ(conn, options)
 - **Redis Queue**: 适合对性能要求高、消息处理简单的场景，现已支持重试和死信队列
 - **RabbitMQ**: 适合企业级应用，需要复杂路由和可靠性保证，具备全面的错误处理能力
 - **NATS Core**: 适合云原生微服务架构，提供超高性能的消息传递
-- **NATS JetStream**: 适合需要持久化的云原生数据流平台，支持流式处理和消息重放
+- **NATS JetStream**: 适合需要持久化的云原生数据流平台，支持三种投递模式（WorkQueue/Broadcast/Limits）满足不同业务场景
 
 ### 🚀 新特性亮点
 
@@ -492,6 +600,7 @@ bus, err := eventbus.NewRabbitMQ(conn, options)
 - **错误隔离**: 单个消息处理错误不会中断整个订阅循环
 - **云原生支持**: 新增NATS Core和JetStream支持，适应现代微服务架构
 - **统一体验**: 所有后端实现提供一致的重试和错误处理机制
+- **JetStream 三模式**: 支持 WorkQueue（任务分发）、Broadcast（广播）、Limits（历史回溯）三种投递模式
 
 ## 项目结构
 
@@ -500,12 +609,13 @@ eventbus/
 ├── eventbus.go          # 核心接口定义
 ├── message.go           # 消息结构和死信处理
 ├── context.go           # 上下文处理
+├── delivery_mode.go     # NATS JetStream 投递模式定义
 ├── serializer.go        # 序列化器
 ├── logger.go            # 日志器
 ├── redis.go             # Redis Streams 实现
 ├── redisqueue.go        # Redis Queue 实现
 ├── nats.go              # NATS Core 实现
-├── nats_jetstream.go    # NATS JetStream 实现
+├── nats_jetstream.go    # NATS JetStream 实现（支持三种投递模式）
 ├── rabbitmq.go          # RabbitMQ 实现
 ├── examples/            # 示例代码
 │   ├── redis/
