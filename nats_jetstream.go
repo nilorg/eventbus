@@ -184,7 +184,7 @@ func (n *natsJetStreamEventBus) ensureStreams() error {
 			// 流已存在，尝试更新配置
 			_, err = n.js.UpdateStream(config)
 			if err != nil {
-				n.options.Logger.Warnf(context.Background(), "Failed to update stream %s: %v", streamName, err)
+				return fmt.Errorf("failed to update stream %s: %w", streamName, err)
 			}
 		}
 	}
