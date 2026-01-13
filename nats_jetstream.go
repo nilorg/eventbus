@@ -3,6 +3,7 @@ package eventbus
 import (
 	"context"
 	"fmt"
+	"math/rand"
 	"strings"
 	"time"
 
@@ -38,10 +39,12 @@ var (
 		MaxAge:                 24 * time.Hour,
 		DuplicateWindow:        2 * time.Minute,
 		Replicas:               1,
-		AckWait:                defaultAPITimeout,          // 官方默认值: 5s
-		MaxDeliver:             -1,                         // 官方服务器默认值: -1 (无限)
-		MaxWaiting:             512,                        // NATS JetStream 服务器默认值
-		PublishAsyncMaxPending: defaultAsyncPubAckInflight, // 官方默认值: 4000
+		AckWait:                defaultAPITimeout,                  // 官方默认值: 5s
+		MaxDeliver:             -1,                                 // 官方服务器默认值: -1 (无限)
+		MaxWaiting:             512,                                // NATS JetStream 服务器默认值
+		PublishAsyncMaxPending: defaultAsyncPubAckInflight,         // 官方默认值: 4000
+		DefaultDeliveryMode:    NATSJetStreamDeliveryModeWorkQueue, // 默认使用工作队列模式
+		InactiveThreshold:      24 * time.Hour,                     // 消费者不活跃自动删除时间
 	}
 )
 
@@ -59,21 +62,24 @@ type NATSJetStreamOptions struct {
 	QueueGroup        string        // 队列组名，用于负载均衡
 
 	// JetStream 特有配置
-	StreamName             string        // 流名称
-	MaxMsgs                int64         // 流中最大消息数
-	MaxAge                 time.Duration // 消息最大保存时间
-	DuplicateWindow        time.Duration // 重复消息检测窗口
-	Replicas               int           // 副本数
-	AckWait                time.Duration // 消息确认等待时间
-	MaxDeliver             int           // 最大投递次数
-	MaxWaiting             int           // Pull消费者最大等待请求数
-	PublishAsyncMaxPending int           // 异步发布最大待处理数
+	StreamName             string                    // 流名称前缀（会根据模式自动添加后缀）
+	MaxMsgs                int64                     // 流中最大消息数
+	MaxAge                 time.Duration             // 消息最大保存时间
+	DuplicateWindow        time.Duration             // 重复消息检测窗口
+	Replicas               int                       // 副本数
+	AckWait                time.Duration             // 消息确认等待时间
+	MaxDeliver             int                       // 最大投递次数
+	MaxWaiting             int                       // Pull消费者最大等待请求数
+	PublishAsyncMaxPending int                       // 异步发布最大待处理数
+	DefaultDeliveryMode    NATSJetStreamDeliveryMode // 默认投递模式
+	InactiveThreshold      time.Duration             // 消费者不活跃自动删除时间（仅Broadcast模式）
 }
 
 type natsJetStreamEventBus struct {
 	options *NATSJetStreamOptions
 	conn    *nats.Conn
 	js      nats.JetStreamContext
+	streams map[NATSJetStreamDeliveryMode]string // 模式对应的Stream名称
 }
 
 // NewNATSJetStream 创建NATS JetStream事件总线
@@ -114,44 +120,72 @@ func NewNATSJetStream(conn *nats.Conn, options ...*NATSJetStreamOptions) (bus Ev
 		options: opts,
 		conn:    conn,
 		js:      js,
+		streams: make(map[NATSJetStreamDeliveryMode]string),
 	}
 
 	// 确保流存在
-	err = natsJSEventBus.ensureStream()
+	err = natsJSEventBus.ensureStreams()
 	if err != nil {
-		return nil, fmt.Errorf("failed to ensure stream: %w", err)
+		return nil, fmt.Errorf("failed to ensure streams: %w", err)
 	}
 
 	return natsJSEventBus, nil
 }
 
-// ensureStream 确保JetStream流存在
-func (n *natsJetStreamEventBus) ensureStream() error {
-	streamConfig := &nats.StreamConfig{
-		Name:       n.options.StreamName,
-		Subjects:   []string{fmt.Sprintf("%s.>", n.options.StreamName)},
-		MaxMsgs:    n.options.MaxMsgs,
-		MaxAge:     n.options.MaxAge,
-		Duplicates: n.options.DuplicateWindow,
-		Replicas:   n.options.Replicas,
-		Storage:    nats.FileStorage,
-		Retention:  nats.WorkQueuePolicy,
-		Discard:    nats.DiscardOld,
+// getStreamName 获取指定模式的Stream名称
+func (n *natsJetStreamEventBus) getStreamName(mode NATSJetStreamDeliveryMode) string {
+	switch mode {
+	case NATSJetStreamDeliveryModeBroadcast:
+		return n.options.StreamName + "_BROADCAST"
+	case NATSJetStreamDeliveryModeLimits:
+		return n.options.StreamName + "_LIMITS"
+	default:
+		return n.options.StreamName
+	}
+}
+
+// ensureStreams 确保所有模式的JetStream流存在
+func (n *natsJetStreamEventBus) ensureStreams() error {
+	// 定义三种模式的Stream配置
+	streamConfigs := []struct {
+		mode      NATSJetStreamDeliveryMode
+		retention nats.RetentionPolicy
+	}{
+		{NATSJetStreamDeliveryModeWorkQueue, nats.WorkQueuePolicy}, // 任务分发：消息只被一个消费者处理
+		{NATSJetStreamDeliveryModeBroadcast, nats.InterestPolicy},  // 广播：所有订阅者都收到
+		{NATSJetStreamDeliveryModeLimits, nats.LimitsPolicy},       // 历史回溯：保留消息直到达到限制
 	}
 
-	_, err := n.js.StreamInfo(n.options.StreamName)
-	if err != nil {
-		// 流不存在，创建它
-		_, err = n.js.AddStream(streamConfig)
-		if err != nil {
-			return fmt.Errorf("failed to create stream %s: %w", n.options.StreamName, err)
+	for _, sc := range streamConfigs {
+		streamName := n.getStreamName(sc.mode)
+		n.streams[sc.mode] = streamName
+
+		config := &nats.StreamConfig{
+			Name:       streamName,
+			Subjects:   []string{fmt.Sprintf("%s.>", streamName)},
+			MaxMsgs:    n.options.MaxMsgs,
+			MaxAge:     n.options.MaxAge,
+			Duplicates: n.options.DuplicateWindow,
+			Replicas:   n.options.Replicas,
+			Storage:    nats.FileStorage,
+			Retention:  sc.retention,
+			Discard:    nats.DiscardOld,
 		}
-		n.options.Logger.Infof(context.Background(), "Created JetStream stream: %s", n.options.StreamName)
-	} else {
-		// 流已存在，更新配置
-		_, err = n.js.UpdateStream(streamConfig)
+
+		_, err := n.js.StreamInfo(streamName)
 		if err != nil {
-			n.options.Logger.Warnf(context.Background(), "Failed to update stream %s: %v", n.options.StreamName, err)
+			// 流不存在，创建它
+			_, err = n.js.AddStream(config)
+			if err != nil {
+				return fmt.Errorf("failed to create stream %s: %w", streamName, err)
+			}
+			n.options.Logger.Infof(context.Background(), "Created JetStream stream: %s (Retention: %s)", streamName, sc.retention)
+		} else {
+			// 流已存在，尝试更新配置
+			_, err = n.js.UpdateStream(config)
+			if err != nil {
+				n.options.Logger.Warnf(context.Background(), "Failed to update stream %s: %v", streamName, err)
+			}
 		}
 	}
 
@@ -159,16 +193,16 @@ func (n *natsJetStreamEventBus) ensureStream() error {
 }
 
 // ensureConsumer 确保消费者存在并更新可变配置
-func (n *natsJetStreamEventBus) ensureConsumer(ctx context.Context, consumerName string, config *nats.ConsumerConfig) error {
+func (n *natsJetStreamEventBus) ensureConsumer(ctx context.Context, streamName, consumerName string, config *nats.ConsumerConfig) error {
 	// 先尝试获取现有消费者信息
-	existingConsumer, err := n.js.ConsumerInfo(n.options.StreamName, consumerName)
+	existingConsumer, err := n.js.ConsumerInfo(streamName, consumerName)
 	if err != nil {
 		// 消费者不存在，创建新的
-		_, err = n.js.AddConsumer(n.options.StreamName, config)
+		_, err = n.js.AddConsumer(streamName, config)
 		if err != nil {
-			return fmt.Errorf("failed to create consumer %s: %w", consumerName, err)
+			return fmt.Errorf("failed to create consumer %s on stream %s: %w", consumerName, streamName, err)
 		}
-		n.options.Logger.Infof(ctx, "Created JetStream consumer: %s (MaxWaiting: %d)", consumerName, config.MaxWaiting)
+		n.options.Logger.Infof(ctx, "Created JetStream consumer: %s on stream %s (MaxWaiting: %d)", consumerName, streamName, config.MaxWaiting)
 		return nil
 	}
 
@@ -207,7 +241,7 @@ func (n *natsJetStreamEventBus) ensureConsumer(ctx context.Context, consumerName
 			ReplayPolicy:   existingConsumer.Config.ReplayPolicy,
 		}
 
-		_, err = n.js.UpdateConsumer(n.options.StreamName, updateConfig)
+		_, err = n.js.UpdateConsumer(streamName, updateConfig)
 		if err != nil {
 			n.options.Logger.Warnf(ctx, "Failed to update consumer %s: %v (changes: %v)", consumerName, err, updateReasons)
 			// 更新失败不影响订阅，继续使用现有配置
@@ -222,8 +256,9 @@ func (n *natsJetStreamEventBus) ensureConsumer(ctx context.Context, consumerName
 }
 
 // getJetStreamSubject 获取JetStream主题名
-func (n *natsJetStreamEventBus) getJetStreamSubject(topic string) string {
-	return fmt.Sprintf("%s.%s", n.options.StreamName, topic)
+func (n *natsJetStreamEventBus) getJetStreamSubject(mode NATSJetStreamDeliveryMode, topic string) string {
+	streamName := n.getStreamName(mode)
+	return fmt.Sprintf("%s.%s", streamName, topic)
 }
 
 // sanitizeConsumerName 生成合法的 Consumer 名称
@@ -292,7 +327,13 @@ func (n *natsJetStreamEventBus) publishWithRetry(ctx context.Context, topic stri
 		return fmt.Errorf("failed to marshal message: %w", err)
 	}
 
-	jsSubject := n.getJetStreamSubject(topic)
+	// 从上下文获取投递模式
+	mode := n.options.DefaultDeliveryMode
+	if ctxMode, ok := FromNATSJetStreamDeliveryModeContext(ctx); ok {
+		mode = ctxMode
+	}
+
+	jsSubject := n.getJetStreamSubject(mode, topic)
 
 	// 执行重试逻辑
 	retryInterval := n.options.RetryInterval
@@ -324,9 +365,9 @@ func (n *natsJetStreamEventBus) publishWithRetry(ctx context.Context, topic stri
 		_, err = n.js.Publish(jsSubject, data, opts...)
 		if err == nil {
 			if isAsync {
-				n.options.Logger.Debugf(ctx, "Published async message to JetStream subject %s (attempt %d)", jsSubject, attempt+1)
+				n.options.Logger.Debugf(ctx, "Published async message to JetStream subject %s (mode: %s, attempt %d)", jsSubject, mode, attempt+1)
 			} else {
-				n.options.Logger.Debugf(ctx, "Published message to JetStream subject %s (attempt %d)", jsSubject, attempt+1)
+				n.options.Logger.Debugf(ctx, "Published message to JetStream subject %s (mode: %s, attempt %d)", jsSubject, mode, attempt+1)
 			}
 			return nil
 		}
@@ -363,7 +404,8 @@ func (n *natsJetStreamEventBus) sendToDeadLetter(ctx context.Context, originalTo
 		return
 	}
 
-	dlqSubject := n.getJetStreamSubject(n.options.DeadLetterSubject)
+	// 死信队列使用 WorkQueue 模式
+	dlqSubject := n.getJetStreamSubject(NATSJetStreamDeliveryModeWorkQueue, n.options.DeadLetterSubject)
 	if _, err := n.js.Publish(dlqSubject, data); err != nil {
 		n.options.Logger.Errorf(ctx, "Failed to publish to dead letter subject %s: %v",
 			dlqSubject, err)
@@ -384,61 +426,102 @@ func (n *natsJetStreamEventBus) SubscribeAsync(ctx context.Context, topic string
 }
 
 // subscribe 内部订阅实现
+// 根据 NATSJetStreamDeliveryMode 处理不同的消费模式：
+// - WorkQueue: Group 被忽略，所有实例共享一个 Consumer，消息只被一个消费者处理
+// - Broadcast: Group 作为实例标识，每个 Group 创建独立的 Consumer，所有订阅者都收到消息
+// - Limits: Group 可选用于负载均衡，支持历史消息回溯
 func (n *natsJetStreamEventBus) subscribe(ctx context.Context, topic string, h SubscribeHandler, isAsync bool) error {
-	jsSubject := n.getJetStreamSubject(topic)
+	// 从上下文获取投递模式
+	mode := n.options.DefaultDeliveryMode
+	if ctxMode, ok := FromNATSJetStreamDeliveryModeContext(ctx); ok {
+		mode = ctxMode
+	}
+
+	// 获取 Stream 名称和 Subject
+	streamName := n.getStreamName(mode)
+	jsSubject := n.getJetStreamSubject(mode, topic)
 
 	// 包装处理函数
 	handler := func(msg *nats.Msg) {
 		n.processMessage(ctx, msg, h, topic)
 	}
 
-	// 创建消费者配置
 	var sub *nats.Subscription
 	var err error
+	var consumerName string
 
-	// 检查是否有队列组设置
-	groupID, hasGroup := FromGroupIDContext(ctx)
-	effectiveGroup := n.getEffectiveQueueGroup(ctx)
+	// 根据模式确定 Consumer 名称策略
+	groupID, _ := FromGroupIDContext(ctx)
 
-	if hasGroup && groupID != "" || n.options.QueueGroup != "" {
-		// 使用JetStream Pull订阅实现队列组功能
-		consumerName := sanitizeConsumerName(effectiveGroup, topic)
+	switch mode {
+	case NATSJetStreamDeliveryModeWorkQueue:
+		// WorkQueue 模式：忽略 Group，所有实例共享一个 Consumer
+		// Consumer 名称只与 topic 相关
+		consumerName = sanitizeConsumerName("workqueue", topic)
+		n.options.Logger.Debugf(ctx, "WorkQueue mode: Group ignored, using shared consumer %s", consumerName)
 
-		// 创建或获取消费者
-		consumerConfig := &nats.ConsumerConfig{
-			Durable:       consumerName,
-			AckPolicy:     nats.AckExplicitPolicy,
-			AckWait:       n.options.AckWait,
-			MaxDeliver:    n.options.MaxDeliver,
-			FilterSubject: jsSubject,
-			DeliverGroup:  effectiveGroup,
-			MaxWaiting:    n.options.MaxWaiting,
+	case NATSJetStreamDeliveryModeBroadcast:
+		// Broadcast 模式：Group 作为实例标识，每个 Group 创建独立 Consumer
+		// 如果没有 Group，使用默认配置的 QueueGroup 或生成唯一 ID
+		effectiveGroup := groupID
+		if effectiveGroup == "" {
+			effectiveGroup = n.options.QueueGroup
 		}
-
-		// 确保消费者存在并更新配置
-		err = n.ensureConsumer(ctx, consumerName, consumerConfig)
-		if err != nil {
-			return fmt.Errorf("failed to ensure consumer %s: %w", consumerName, err)
+		if effectiveGroup == "" {
+			// 没有 Group 时生成唯一实例 ID
+			effectiveGroup = fmt.Sprintf("instance_%d_%d", time.Now().UnixNano(), rand.Int63())
 		}
+		consumerName = sanitizeConsumerName(effectiveGroup, topic)
+		n.options.Logger.Debugf(ctx, "Broadcast mode: Using instance-specific consumer %s (group: %s)", consumerName, effectiveGroup)
 
-		// 创建Pull订阅
-		sub, err = n.js.PullSubscribe(jsSubject, consumerName)
-		if err != nil {
-			return fmt.Errorf("failed to create pull subscription for topic %s: %w", topic, err)
+	case NATSJetStreamDeliveryModeLimits:
+		// Limits 模式：Group 可选用于负载均衡
+		effectiveGroup := groupID
+		if effectiveGroup == "" {
+			effectiveGroup = n.options.QueueGroup
 		}
+		if effectiveGroup == "" {
+			effectiveGroup = "default"
+		}
+		consumerName = sanitizeConsumerName(effectiveGroup, topic)
+		n.options.Logger.Debugf(ctx, "Limits mode: Using group-based consumer %s (group: %s)", consumerName, effectiveGroup)
 
-		// 启动消息拉取循环
-		go n.pullMessages(ctx, sub, handler)
-	} else {
-		// 使用普通的Push订阅
-		sub, err = n.js.Subscribe(jsSubject, handler, nats.AckExplicit())
-		if err != nil {
-			return fmt.Errorf("failed to subscribe to JetStream subject %s: %w", jsSubject, err)
-		}
+	default:
+		return fmt.Errorf("unsupported delivery mode: %d", mode)
 	}
 
-	n.options.Logger.Infof(ctx, "Subscribed to JetStream subject %s (async: %v, group: %s)",
-		jsSubject, isAsync, effectiveGroup)
+	// 创建消费者配置
+	consumerConfig := &nats.ConsumerConfig{
+		Durable:       consumerName,
+		AckPolicy:     nats.AckExplicitPolicy,
+		AckWait:       n.options.AckWait,
+		MaxDeliver:    n.options.MaxDeliver,
+		FilterSubject: jsSubject,
+		MaxWaiting:    n.options.MaxWaiting,
+	}
+
+	// Broadcast 模式特殊配置：设置不活跃清理时间
+	if mode == NATSJetStreamDeliveryModeBroadcast && n.options.InactiveThreshold > 0 {
+		consumerConfig.InactiveThreshold = n.options.InactiveThreshold
+	}
+
+	// 确保消费者存在并更新配置
+	err = n.ensureConsumer(ctx, streamName, consumerName, consumerConfig)
+	if err != nil {
+		return fmt.Errorf("failed to ensure consumer %s on stream %s: %w", consumerName, streamName, err)
+	}
+
+	// 创建 Pull 订阅
+	sub, err = n.js.PullSubscribe(jsSubject, consumerName, nats.Bind(streamName, consumerName))
+	if err != nil {
+		return fmt.Errorf("failed to create pull subscription for topic %s on stream %s: %w", topic, streamName, err)
+	}
+
+	// 启动消息拉取循环
+	go n.pullMessages(ctx, sub, handler)
+
+	n.options.Logger.Infof(ctx, "Subscribed to JetStream subject %s (mode: %s, consumer: %s, async: %v)",
+		jsSubject, mode, consumerName, isAsync)
 
 	// 监听上下文取消，自动取消订阅
 	if !isAsync {
