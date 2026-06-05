@@ -1,0 +1,14 @@
+syntax = "proto3";
+package proto;
+
+option go_package = "github.com/nilorg/eventbus/proto";
+
+message DeadLetterMessage {
+    string original_id = 1;
+    string original_topic = 2;
+    int64 failed_at = 3;
+    string error_reason = 4;
+    bytes original_values = 5;
+    map<string, string> original_header = 6;
+    string source = 7;
+}

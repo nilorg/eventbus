@@ -8,14 +8,14 @@ func TestMessageAssert(t *testing.T) {
 	if _, ok := v.(*Message); ok {
 		t.Log("指针")
 	}
-	if _, ok := v.(Message); ok {
+	if ok := v.(*Message) != nil; ok {
 		t.Log("非指针")
 	}
-	v = Message{}
+	v = &Message{}
 	if _, ok := v.(*Message); ok {
 		t.Log("指针")
 	}
-	if _, ok := v.(Message); ok {
+	if ok := v.(*Message) != nil; ok {
 		t.Log("非指针")
 	}
 }

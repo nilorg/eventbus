@@ -1,0 +1,9 @@
+syntax = "proto3";
+package proto;
+
+option go_package = "github.com/nilorg/eventbus/proto";
+
+message Message {
+    map<string, string> header = 1;
+    bytes value = 2;
+}

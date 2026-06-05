@@ -228,7 +228,7 @@ func (bus *rabbitMQEventBus) sendToDeadLetter(ctx context.Context, originalTopic
 		return nil
 	}
 
-	dlqMsg := CreateDeadLetterMessage(originalTopic, msg, errorReason, bus.options.DeadLetterExchange, "rabbitmq")
+	dlqMsg := CreateDeadLetterMessage(originalTopic, msg, errorReason, bus.options.DeadLetterExchange, "rabbitmq", bus.options.Serialize)
 
 	err := bus.executeWithRetry(ctx, func() error {
 		ch, err := bus.getChannel(ctx)
@@ -333,44 +333,28 @@ func (bus *rabbitMQEventBus) PublishAsync(ctx context.Context, topic string, v i
 }
 
 func (bus *rabbitMQEventBus) publish(ctx context.Context, topic string, v interface{}, async bool) (err error) {
-	var (
-		msg   *Message
-		msgOK bool
-	)
-	if v1, v1Ok := v.(*Message); v1Ok {
-		msg = v1
-		msgOK = true
-	} else if v2, v2Ok := v.(Message); v2Ok {
-		msg = &v2
-		msgOK = true
-	}
-	if !msgOK {
+	var msg *Message
+	
+	if m, ok := v.(*Message); ok {
+		msg = m
+	} else {
+		eventBytes, marshalErr := bus.options.Serialize.Marshal(v)
+		if marshalErr != nil {
+			return fmt.Errorf("stage 1 marshal event failed: %w", marshalErr)
+		}
+		
 		msg = &Message{
-			Header: make(MessageHeader),
-			Value:  v,
+			Header: extractHeaders(ctx, topic),
+			Value:  eventBytes,
 		}
 	}
 
-	// 自动注入 topic 到消息头
-	msg.Header["topic"] = topic
-
-	// set message header
-	if f, ok := FromSetMessageHeaderContext(ctx); ok {
-		if headers := f(ctx); headers != nil {
-			for key, value := range headers {
-				msg.Header[key] = value
-			}
-		}
-	}
-
-	var data []byte
-	data, err = bus.options.Serialize.Marshal(msg.Value)
+	msgBytes, err := bus.options.Serialize.Marshal(msg)
 	if err != nil {
-		return
+		return fmt.Errorf("stage 2 marshal message failed: %w", err)
 	}
-	bus.options.Logger.Debugf(ctx, "publish msg data: %s", string(data))
+	bus.options.Logger.Debugf(ctx, "publish msg data: %s", string(msgBytes))
 
-	// 使用重试机制发布消息
 	return bus.executeWithRetry(ctx, func() error {
 		ch, err := bus.getChannel(ctx)
 		if err != nil {
@@ -384,27 +368,34 @@ func (bus *rabbitMQEventBus) publish(ctx context.Context, topic string, v interf
 		}
 
 		return ch.Publish(
-			bus.options.ExchangeName, //交换
-			topic,                    //路由密钥
-			!async,                   //强制
-			false,                    //立即
+			bus.options.ExchangeName,
+			topic,
+			!async,
+			false,
 			amqp.Publishing{
 				Headers:     headers,
 				ContentType: bus.options.Serialize.ContentType(),
-				Body:        data,
+				Body:        msgBytes,
 			})
 	})
 }
 
-func (bus *rabbitMQEventBus) Subscribe(ctx context.Context, topic string, h SubscribeHandler) (err error) {
-	return bus.subscribe(ctx, topic, h, false)
+func (bus *rabbitMQEventBus) Subscribe(ctx context.Context, topic string, h SubscribeHandler, opts ...SubscribeOption) (err error) {
+	return bus.subscribe(ctx, topic, h, false, opts...)
 }
 
-func (bus *rabbitMQEventBus) SubscribeAsync(ctx context.Context, topic string, h SubscribeHandler) (err error) {
-	return bus.subscribe(ctx, topic, h, true)
+func (bus *rabbitMQEventBus) SubscribeAsync(ctx context.Context, topic string, h SubscribeHandler, opts ...SubscribeOption) (err error) {
+	return bus.subscribe(ctx, topic, h, true, opts...)
 }
 
-func (bus *rabbitMQEventBus) subscribe(ctx context.Context, topic string, h SubscribeHandler, async bool) (err error) {
+func (bus *rabbitMQEventBus) subscribe(ctx context.Context, topic string, h SubscribeHandler, async bool, opts ...SubscribeOption) (err error) {
+	options := &SubscribeOptions{
+		Converter: &AutoConverter{},
+	}
+	for _, opt := range opts {
+		opt(options)
+	}
+
 	var ch *rabbitmq.Channel
 	if ch, err = bus.getChannel(ctx); err != nil {
 		return
@@ -450,19 +441,19 @@ func (bus *rabbitMQEventBus) subscribe(ctx context.Context, topic string, h Subs
 
 	if async {
 		go func(subCtx context.Context, subCh *rabbitmq.Channel) {
-			if asyncErr := bus.handleSubMessage(subCtx, msgs, h); asyncErr != nil {
+			if asyncErr := bus.handleSubMessage(subCtx, msgs, h, options); asyncErr != nil {
 				bus.options.Logger.Errorf(subCtx, "async subscribe %s error: %v", topic, asyncErr)
 			}
 			bus.putChannel(subCh)
 		}(ctx, ch)
 	} else {
-		err = bus.handleSubMessage(ctx, msgs, h)
+		err = bus.handleSubMessage(ctx, msgs, h, options)
 		bus.putChannel(ch)
 	}
 	return
 }
 
-func (bus *rabbitMQEventBus) handleSubMessage(ctx context.Context, msgs <-chan amqp.Delivery, h SubscribeHandler) (err error) {
+func (bus *rabbitMQEventBus) handleSubMessage(ctx context.Context, msgs <-chan amqp.Delivery, h SubscribeHandler, options *SubscribeOptions) (err error) {
 	for {
 		select {
 		case msg := <-msgs:
@@ -474,31 +465,32 @@ func (bus *rabbitMQEventBus) handleSubMessage(ctx context.Context, msgs <-chan a
 				continue
 			}
 
-			m := Message{
-				Header: make(MessageHeader),
-			}
-			for k, v := range msg.Headers {
-				m.Header[k] = fmt.Sprint(v)
-			}
-
 			bus.options.Logger.Debugf(ctx, "subscribe msg data: %s", string(msg.Body))
 
-			// 反序列化消息
-			if unmarshalErr := bus.options.Serialize.Unmarshal(msg.Body, &m.Value); unmarshalErr != nil {
-				bus.options.Logger.Errorf(ctx, "failed to unmarshal message: %v", unmarshalErr)
+			contentType := msg.ContentType
+			if contentType == "" {
+				contentType = bus.options.Serialize.ContentType()
+			}
+
+			convertedMsg, convertErr := options.Converter.Convert(msg.Body, contentType)
+			if convertErr != nil {
+				bus.options.Logger.Errorf(ctx, "failed to convert message: %v", convertErr)
 				if bus.options.SkipBadMessages {
-					// 跳过无法反序列化的消息
 					if ackErr := msg.Ack(false); ackErr != nil {
 						bus.options.Logger.Errorf(ctx, "failed to ack bad message: %v", ackErr)
 					}
 					continue
 				}
-				return unmarshalErr
+				return convertErr
 			}
 
-			// 获取原始topic
+			convertedMsg.Header = make(map[string]string)
+			for k, v := range msg.Headers {
+				convertedMsg.Header[k] = fmt.Sprint(v)
+			}
+
 			originalTopic := msg.RoutingKey
-			if topicFromHeader, exists := m.Header["topic"]; exists {
+			if topicFromHeader, exists := convertedMsg.Header["topic"]; exists {
 				originalTopic = topicFromHeader
 			}
 
@@ -518,7 +510,7 @@ func (bus *rabbitMQEventBus) handleSubMessage(ctx context.Context, msgs <-chan a
 			}
 
 			// 处理消息
-			handlerErr := h(ctx, &m)
+			handlerErr := h(ctx, convertedMsg)
 
 			if handlerErr == nil {
 				// 成功处理，确认消息
@@ -557,7 +549,7 @@ func (bus *rabbitMQEventBus) handleSubMessage(ctx context.Context, msgs <-chan a
 					bus.options.Logger.Errorf(ctx, "message exceeded max retries (%d), sending to dead letter queue", bus.options.MessageMaxRetries)
 
 					// 先发送到死信队列（保证消息不丢失）
-					if dlqErr := bus.sendToDeadLetter(ctx, originalTopic, &m, handlerErr.Error()); dlqErr != nil {
+					if dlqErr := bus.sendToDeadLetter(ctx, originalTopic, convertedMsg, handlerErr.Error()); dlqErr != nil {
 						// 死信队列发送失败，不能直接 Ack，否则消息会丢失
 						// 使用 Nack 但不重新入队（requeue=false），让 RabbitMQ 的死信机制处理
 						// 或者如果没有配置 RabbitMQ 原生死信队列，则记录日志后 Ack（接受风险）

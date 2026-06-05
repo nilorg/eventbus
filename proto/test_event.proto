@@ -1,0 +1,14 @@
+syntax = "proto3";
+package proto;
+
+option go_package = "github.com/nilorg/eventbus/proto";
+
+message TestEvent {
+    string message = 1;
+    int32 count = 2;
+}
+
+message UserCreated {
+    string user_id = 1;
+    string name = 2;
+}

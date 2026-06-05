@@ -83,30 +83,23 @@ func (n *natsEventBus) PublishAsync(ctx context.Context, topic string, v interfa
 func (n *natsEventBus) publishWithRetry(ctx context.Context, topic string, v interface{}, isAsync bool) error {
 	var msg *Message
 
-	// 检查是否已经是 Message 类型
 	if m, ok := v.(*Message); ok {
 		msg = m
 	} else {
+		eventBytes, err := n.options.Serialize.Marshal(v)
+		if err != nil {
+			return fmt.Errorf("stage 1 marshal event failed: %w", err)
+		}
+		
 		msg = &Message{
-			Header: make(MessageHeader),
-			Value:  v,
+			Header: extractHeaders(ctx, topic),
+			Value:  eventBytes,
 		}
 	}
 
-	// 从上下文中获取消息头设置函数
-	if setHeader, ok := FromSetMessageHeaderContext(ctx); ok {
-		for k, v := range setHeader(ctx) {
-			msg.Header[k] = v
-		}
-	}
-
-	// 自动注入 topic 到消息头
-	msg.Header["topic"] = topic
-
-	// 序列化消息
 	data, err := n.options.Serialize.Marshal(msg)
 	if err != nil {
-		return fmt.Errorf("failed to marshal message: %w", err)
+		return fmt.Errorf("stage 2 marshal message failed: %w", err)
 	}
 
 	// 执行重试逻辑
@@ -159,7 +152,7 @@ func (n *natsEventBus) sendToDeadLetter(ctx context.Context, originalTopic strin
 		return
 	}
 
-	dlqMsg := CreateDeadLetterMessage(originalTopic, msg, errorReason, n.options.DeadLetterSubject, "nats")
+	dlqMsg := CreateDeadLetterMessage(originalTopic, msg, errorReason, n.options.DeadLetterSubject, "nats", n.options.Serialize)
 
 	data, err := n.options.Serialize.Marshal(dlqMsg)
 	if err != nil {
@@ -177,20 +170,24 @@ func (n *natsEventBus) sendToDeadLetter(ctx context.Context, originalTopic strin
 }
 
 // Subscribe 订阅消息（同步）
-func (n *natsEventBus) Subscribe(ctx context.Context, topic string, h SubscribeHandler) error {
-	return n.subscribe(ctx, topic, h, false)
+func (n *natsEventBus) Subscribe(ctx context.Context, topic string, h SubscribeHandler, opts ...SubscribeOption) error {
+	return n.subscribe(ctx, topic, h, false, opts...)
 }
 
-// SubscribeAsync 订阅消息（异步）
-func (n *natsEventBus) SubscribeAsync(ctx context.Context, topic string, h SubscribeHandler) error {
-	return n.subscribe(ctx, topic, h, true)
+func (n *natsEventBus) SubscribeAsync(ctx context.Context, topic string, h SubscribeHandler, opts ...SubscribeOption) error {
+	return n.subscribe(ctx, topic, h, true, opts...)
 }
 
-// subscribe 内部订阅实现
-func (n *natsEventBus) subscribe(ctx context.Context, topic string, h SubscribeHandler, isAsync bool) error {
-	// 包装处理函数
+func (n *natsEventBus) subscribe(ctx context.Context, topic string, h SubscribeHandler, isAsync bool, opts ...SubscribeOption) error {
+	options := &SubscribeOptions{
+		Converter: &AutoConverter{},
+	}
+	for _, opt := range opts {
+		opt(options)
+	}
+
 	handler := func(msg *nats.Msg) {
-		n.processMessage(ctx, msg, h, topic)
+		n.processMessage(ctx, msg, h, topic, options)
 	}
 
 	var sub *nats.Subscription
@@ -230,32 +227,37 @@ func (n *natsEventBus) subscribe(ctx context.Context, topic string, h SubscribeH
 }
 
 // processMessage 处理接收到的消息
-func (n *natsEventBus) processMessage(ctx context.Context, natsMsg *nats.Msg, h SubscribeHandler, topic string) {
-	var msg Message
-	if err := n.options.Serialize.Unmarshal(natsMsg.Data, &msg); err != nil {
-		n.options.Logger.Errorf(ctx, "Failed to unmarshal message from topic %s: %v", topic, err)
+func (n *natsEventBus) processMessage(ctx context.Context, natsMsg *nats.Msg, h SubscribeHandler, topic string, options *SubscribeOptions) {
+	contentType := ""
+	if natsMsg.Header != nil {
+		contentType = natsMsg.Header.Get("Content-Type")
+	}
+	if contentType == "" {
+		contentType = n.options.Serialize.ContentType()
+	}
+
+	msg, err := options.Converter.Convert(natsMsg.Data, contentType)
+	if err != nil {
+		n.options.Logger.Errorf(ctx, "Failed to convert message from topic %s: %v", topic, err)
 		if n.options.SkipBadMessages {
 			return
 		}
-		// 如果不跳过坏消息，创建一个基本消息结构发送到死信队列
 		badMsg := &Message{
-			Header: MessageHeader{
+			Header: map[string]string{
 				"topic": topic,
-				"error": "unmarshal_failed",
+				"error": "convert_failed",
 			},
-			Value: string(natsMsg.Data),
+			Value: natsMsg.Data,
 		}
 		n.sendToDeadLetter(ctx, topic, badMsg, err.Error())
 		return
 	}
 
-	// 获取原始topic（如果消息头中有的话）
 	originalTopic := topic
 	if topicFromHeader, exists := msg.Header["topic"]; exists {
 		originalTopic = topicFromHeader
 	}
 
-	// 执行消息处理
 	retryInterval := n.options.RetryInterval
 	var lastErr error
 	for attempt := 0; attempt <= n.options.MessageMaxRetries; attempt++ {
@@ -264,7 +266,6 @@ func (n *natsEventBus) processMessage(ctx context.Context, natsMsg *nats.Msg, h 
 			case <-ctx.Done():
 				return
 			case <-time.After(retryInterval):
-				// 计算下次重试间隔
 				retryInterval = time.Duration(float64(retryInterval) * n.options.BackoffMultiplier)
 				if retryInterval > n.options.MaxBackoff {
 					retryInterval = n.options.MaxBackoff
@@ -272,20 +273,21 @@ func (n *natsEventBus) processMessage(ctx context.Context, natsMsg *nats.Msg, h 
 			}
 		}
 
-		err := h(ctx, &msg)
-		if err == nil {
-			n.options.Logger.Debugf(ctx, "Successfully processed message from topic %s (attempt %d)",
-				topic, attempt+1)
+		handlerErr := h(ctx, msg)
+		if handlerErr == nil {
+			n.options.Logger.Debugf(ctx, "Successfully processed message from topic %s (attempt %d)", originalTopic, attempt+1)
 			return
 		}
 
-		lastErr = err
+		lastErr = handlerErr
 		n.options.Logger.Warnf(ctx, "Failed to process message from topic %s (attempt %d/%d): %v",
-			topic, attempt+1, n.options.MessageMaxRetries+1, err)
+			originalTopic, attempt+1, n.options.MessageMaxRetries+1, handlerErr)
 	}
 
-	// 如果处理失败，发送到死信队列
-	n.sendToDeadLetter(ctx, originalTopic, &msg, lastErr.Error())
+	if lastErr != nil {
+		n.options.Logger.Errorf(ctx, "Message processing failed after max retries (%d), sending to dead letter queue", n.options.MessageMaxRetries)
+		n.sendToDeadLetter(ctx, originalTopic, msg, lastErr.Error())
+	}
 }
 
 // getEffectiveQueueGroup 获取有效的队列组名
@@ -297,12 +299,9 @@ func (n *natsEventBus) getEffectiveQueueGroup(ctx context.Context) string {
 }
 
 // Close 关闭NATS连接
-// 注意：各个订阅应该通过context取消来自动清理，此方法主要关闭连接
 func (n *natsEventBus) Close() error {
-	// 关闭连接，这会自动取消所有活跃的订阅
-	if n.conn != nil && !n.conn.IsClosed() {
+	if n.conn != nil {
 		n.conn.Close()
 	}
-
 	return nil
 }

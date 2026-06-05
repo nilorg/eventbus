@@ -11,8 +11,8 @@ var (
 
 // Subscriber 订阅接口
 type Subscriber interface {
-	Subscribe(ctx context.Context, topic string, h SubscribeHandler) (err error)
-	SubscribeAsync(ctx context.Context, topic string, h SubscribeHandler) (err error)
+	Subscribe(ctx context.Context, topic string, h SubscribeHandler, opts ...SubscribeOption) (err error)
+	SubscribeAsync(ctx context.Context, topic string, h SubscribeHandler, opts ...SubscribeOption) (err error)
 }
 
 // SubscribeHandler 订阅处理

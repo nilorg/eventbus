@@ -326,30 +326,23 @@ func (n *natsJetStreamEventBus) PublishAsync(ctx context.Context, topic string, 
 func (n *natsJetStreamEventBus) publishWithRetry(ctx context.Context, topic string, v interface{}, isAsync bool) error {
 	var msg *Message
 
-	// 检查是否已经是 Message 类型
 	if m, ok := v.(*Message); ok {
 		msg = m
 	} else {
+		eventBytes, err := n.options.Serialize.Marshal(v)
+		if err != nil {
+			return fmt.Errorf("stage 1 marshal event failed: %w", err)
+		}
+		
 		msg = &Message{
-			Header: make(MessageHeader),
-			Value:  v,
+			Header: extractHeaders(ctx, topic),
+			Value:  eventBytes,
 		}
 	}
 
-	// 从上下文中获取消息头设置函数
-	if setHeader, ok := FromSetMessageHeaderContext(ctx); ok {
-		for k, v := range setHeader(ctx) {
-			msg.Header[k] = v
-		}
-	}
-
-	// 自动注入 topic 到消息头
-	msg.Header["topic"] = topic
-
-	// 序列化消息
 	data, err := n.options.Serialize.Marshal(msg)
 	if err != nil {
-		return fmt.Errorf("failed to marshal message: %w", err)
+		return fmt.Errorf("stage 2 marshal message failed: %w", err)
 	}
 
 	// 从上下文获取投递模式
@@ -421,7 +414,7 @@ func (n *natsJetStreamEventBus) sendToDeadLetter(ctx context.Context, originalTo
 		return
 	}
 
-	dlqMsg := CreateDeadLetterMessage(originalTopic, msg, errorReason, n.options.DeadLetterSubject, "nats-jetstream")
+	dlqMsg := CreateDeadLetterMessage(originalTopic, msg, errorReason, n.options.DeadLetterSubject, "nats-jetstream", n.options.Serialize)
 
 	data, err := n.options.Serialize.Marshal(dlqMsg)
 	if err != nil {
@@ -441,12 +434,12 @@ func (n *natsJetStreamEventBus) sendToDeadLetter(ctx context.Context, originalTo
 }
 
 // Subscribe 订阅消息（同步）
-func (n *natsJetStreamEventBus) Subscribe(ctx context.Context, topic string, h SubscribeHandler) error {
+func (n *natsJetStreamEventBus) Subscribe(ctx context.Context, topic string, h SubscribeHandler, opts ...SubscribeOption) error {
 	return n.subscribe(ctx, topic, h, false)
 }
 
 // SubscribeAsync 订阅消息（异步）
-func (n *natsJetStreamEventBus) SubscribeAsync(ctx context.Context, topic string, h SubscribeHandler) error {
+func (n *natsJetStreamEventBus) SubscribeAsync(ctx context.Context, topic string, h SubscribeHandler, opts ...SubscribeOption) error {
 	return n.subscribe(ctx, topic, h, true)
 }
 
@@ -455,7 +448,14 @@ func (n *natsJetStreamEventBus) SubscribeAsync(ctx context.Context, topic string
 // - WorkQueue: Group 被忽略，所有实例共享一个 Consumer，消息只被一个消费者处理
 // - Broadcast: Group 作为实例标识，每个 Group 创建独立的 Consumer，所有订阅者都收到消息
 // - Limits: Group 可选用于负载均衡，支持历史消息回溯
-func (n *natsJetStreamEventBus) subscribe(ctx context.Context, topic string, h SubscribeHandler, isAsync bool) error {
+func (n *natsJetStreamEventBus) subscribe(ctx context.Context, topic string, h SubscribeHandler, isAsync bool, opts ...SubscribeOption) error {
+	options := &SubscribeOptions{
+		Converter: &AutoConverter{},
+	}
+	for _, opt := range opts {
+		opt(options)
+	}
+
 	// 从上下文获取投递模式
 	mode := n.options.DefaultDeliveryMode
 	if ctxMode, ok := FromNATSJetStreamDeliveryModeContext(ctx); ok {
@@ -468,48 +468,41 @@ func (n *natsJetStreamEventBus) subscribe(ctx context.Context, topic string, h S
 
 	// 包装处理函数
 	handler := func(msg *nats.Msg) {
-		n.processMessage(ctx, msg, h, topic)
+		n.processMessage(ctx, msg, h, topic, options)
 	}
 
-	var sub *nats.Subscription
+var sub *nats.Subscription
 	var err error
 	var consumerName string
 
-	// 根据模式确定 Consumer 名称策略
-	groupID, _ := FromGroupIDContext(ctx)
+	groupID := n.getEffectiveQueueGroup(ctx)
 
 	switch mode {
 	case NATSJetStreamDeliveryModeWorkQueue:
 		// WorkQueue 模式：忽略 Group，所有实例共享一个 Consumer
 		// Consumer 名称只与 topic 相关
 		consumerName = sanitizeConsumerName("workqueue", topic)
-		n.options.Logger.Debugf(ctx, "WorkQueue mode: Group ignored, using shared consumer %s", consumerName)
+		n.options.Logger.Debugf(ctx, "WorkQueue mode: Group ignored (effectiveGroup: %s), using shared consumer %s", groupID, consumerName)
 
 	case NATSJetStreamDeliveryModeBroadcast:
 		// Broadcast 模式：Group 作为实例标识，每个 Group 创建独立 Consumer
-		// 如果没有 Group，使用默认配置的 QueueGroup 或生成唯一 ID
+		// 如果没有有效的 Group，生成唯一实例 ID
 		effectiveGroup := groupID
-		if effectiveGroup == "" {
-			effectiveGroup = n.options.QueueGroup
-		}
 		if effectiveGroup == "" {
 			// 没有 Group 时生成唯一实例 ID
 			effectiveGroup = fmt.Sprintf("instance_%d_%d", time.Now().UnixNano(), rand.Int63())
 		}
 		consumerName = sanitizeConsumerName(effectiveGroup, topic)
-		n.options.Logger.Debugf(ctx, "Broadcast mode: Using instance-specific consumer %s (group: %s)", consumerName, effectiveGroup)
+		n.options.Logger.Debugf(ctx, "Broadcast mode: Using instance-specific consumer %s (effectiveGroup: %s)", consumerName, effectiveGroup)
 
 	case NATSJetStreamDeliveryModeLimits:
 		// Limits 模式：Group 可选用于负载均衡
 		effectiveGroup := groupID
 		if effectiveGroup == "" {
-			effectiveGroup = n.options.QueueGroup
-		}
-		if effectiveGroup == "" {
 			effectiveGroup = "default"
 		}
 		consumerName = sanitizeConsumerName(effectiveGroup, topic)
-		n.options.Logger.Debugf(ctx, "Limits mode: Using group-based consumer %s (group: %s)", consumerName, effectiveGroup)
+		n.options.Logger.Debugf(ctx, "Limits mode: Using group-based consumer %s (effectiveGroup: %s)", consumerName, effectiveGroup)
 
 	default:
 		return fmt.Errorf("unsupported delivery mode: %d", mode)
@@ -607,34 +600,39 @@ func (n *natsJetStreamEventBus) pullMessages(ctx context.Context, sub *nats.Subs
 }
 
 // processMessage 处理接收到的消息
-func (n *natsJetStreamEventBus) processMessage(ctx context.Context, natsMsg *nats.Msg, h SubscribeHandler, topic string) {
-	var msg Message
-	if err := n.options.Serialize.Unmarshal(natsMsg.Data, &msg); err != nil {
-		n.options.Logger.Errorf(ctx, "Failed to unmarshal message from topic %s: %v", topic, err)
+func (n *natsJetStreamEventBus) processMessage(ctx context.Context, natsMsg *nats.Msg, h SubscribeHandler, topic string, options *SubscribeOptions) {
+	contentType := ""
+	if natsMsg.Header != nil {
+		contentType = natsMsg.Header.Get("Content-Type")
+	}
+	if contentType == "" {
+		contentType = n.options.Serialize.ContentType()
+	}
+
+	msg, err := options.Converter.Convert(natsMsg.Data, contentType)
+	if err != nil {
+		n.options.Logger.Errorf(ctx, "Failed to convert message from topic %s: %v", topic, err)
 		if n.options.SkipBadMessages {
-			natsMsg.Ack() // 确认消息以避免重复投递
+			natsMsg.Ack()
 			return
 		}
-		// 如果不跳过坏消息，创建一个基本消息结构发送到死信队列
 		badMsg := &Message{
-			Header: MessageHeader{
+			Header: map[string]string{
 				"topic": topic,
-				"error": "unmarshal_failed",
+				"error": "convert_failed",
 			},
-			Value: string(natsMsg.Data),
+			Value: natsMsg.Data,
 		}
 		n.sendToDeadLetter(ctx, topic, badMsg, err.Error())
 		natsMsg.Nak()
 		return
 	}
 
-	// 获取原始topic（如果消息头中有的话）
 	originalTopic := topic
 	if topicFromHeader, exists := msg.Header["topic"]; exists {
 		originalTopic = topicFromHeader
 	}
 
-	// 执行消息处理
 	retryInterval := n.options.RetryInterval
 	var lastErr error
 	for attempt := 0; attempt <= n.options.MessageMaxRetries; attempt++ {
@@ -652,7 +650,7 @@ func (n *natsJetStreamEventBus) processMessage(ctx context.Context, natsMsg *nat
 			}
 		}
 
-		err := h(ctx, &msg)
+		err := h(ctx, msg)
 		if err == nil {
 			n.options.Logger.Debugf(ctx, "Successfully processed message from topic %s (attempt %d)",
 				topic, attempt+1)
@@ -667,7 +665,7 @@ func (n *natsJetStreamEventBus) processMessage(ctx context.Context, natsMsg *nat
 
 	// 如果处理失败，发送到死信队列并NAK消息
 	if lastErr != nil {
-		n.sendToDeadLetter(ctx, originalTopic, &msg, lastErr.Error())
+		n.sendToDeadLetter(ctx, originalTopic, msg, lastErr.Error())
 	}
 
 	// NAK消息，JetStream会根据配置重新投递

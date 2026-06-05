@@ -22,7 +22,7 @@ func connectJetStream(t *testing.T) *nats.Conn {
 }
 
 // 测试辅助函数：清理 Stream
-func cleanupStreams(t *testing.T, nc *nats.Conn, streamPrefix string) {
+func cleanupStreams(nc *nats.Conn, streamPrefix string) {
 	js, err := nc.JetStream()
 	if err != nil {
 		return
@@ -47,8 +47,8 @@ func TestNATSJetStreamEventBus_Basic(t *testing.T) {
 	defer nc.Close()
 
 	streamName := "TEST_BASIC"
-	cleanupStreams(t, nc, streamName)
-	defer cleanupStreams(t, nc, streamName)
+	cleanupStreams(nc, streamName)
+	defer cleanupStreams(nc, streamName)
 
 	opts := &NATSJetStreamOptions{
 		Serialize:           &JSONSerialize{},
@@ -98,10 +98,10 @@ func TestNATSJetStreamEventBus_Basic(t *testing.T) {
 	// 验证消息接收
 	select {
 	case msg := <-received:
-		if msg.Value != testMessage {
-			t.Errorf("Expected %q, got %q", testMessage, msg.Value)
+		if string(msg.Value) != testMessage {
+			t.Errorf("Expected %q, got %q", testMessage, string(msg.Value))
 		}
-		t.Logf("Received message: %v", msg.Value)
+		t.Logf("Received message: %v", string(msg.Value))
 	case <-time.After(10 * time.Second):
 		t.Error("Timeout waiting for message")
 	}
@@ -115,8 +115,8 @@ func TestNATSJetStreamEventBus_WorkQueueMode(t *testing.T) {
 	defer nc.Close()
 
 	streamName := "TEST_WORKQUEUE"
-	cleanupStreams(t, nc, streamName)
-	defer cleanupStreams(t, nc, streamName)
+	cleanupStreams(nc, streamName)
+	defer cleanupStreams(nc, streamName)
 
 	opts := &NATSJetStreamOptions{
 		Serialize:           &JSONSerialize{},
@@ -222,8 +222,8 @@ func TestNATSJetStreamEventBus_BroadcastMode(t *testing.T) {
 	defer nc.Close()
 
 	streamName := "TEST_BROADCAST"
-	cleanupStreams(t, nc, streamName)
-	defer cleanupStreams(t, nc, streamName)
+	cleanupStreams(nc, streamName)
+	defer cleanupStreams(nc, streamName)
 
 	opts := &NATSJetStreamOptions{
 		Serialize:           &JSONSerialize{},
@@ -327,8 +327,8 @@ func TestNATSJetStreamEventBus_LimitsMode(t *testing.T) {
 	defer nc.Close()
 
 	streamName := "TEST_LIMITS"
-	cleanupStreams(t, nc, streamName)
-	defer cleanupStreams(t, nc, streamName)
+	cleanupStreams(nc, streamName)
+	defer cleanupStreams(nc, streamName)
 
 	opts := &NATSJetStreamOptions{
 		Serialize:           &JSONSerialize{},
@@ -429,8 +429,8 @@ func TestNATSJetStreamEventBus_WorkQueueIgnoresGroup(t *testing.T) {
 	defer nc.Close()
 
 	streamName := "TEST_WQ_IGNORE_GROUP"
-	cleanupStreams(t, nc, streamName)
-	defer cleanupStreams(t, nc, streamName)
+	cleanupStreams(nc, streamName)
+	defer cleanupStreams(nc, streamName)
 
 	opts := &NATSJetStreamOptions{
 		Serialize:           &JSONSerialize{},
@@ -472,8 +472,8 @@ func TestNATSJetStreamEventBus_BroadcastCreatesUniqueConsumers(t *testing.T) {
 	defer nc.Close()
 
 	streamName := "TEST_BC_UNIQUE"
-	cleanupStreams(t, nc, streamName)
-	defer cleanupStreams(t, nc, streamName)
+	cleanupStreams(nc, streamName)
+	defer cleanupStreams(nc, streamName)
 
 	// 验证不同 Group 生成不同的 consumer 名称
 	topic := "test.topic"
@@ -570,8 +570,8 @@ func TestNATSJetStreamEventBus_Close(t *testing.T) {
 	}
 
 	streamName := "TEST_CLOSE"
-	cleanupStreams(t, nc, streamName)
-	defer cleanupStreams(t, nc, streamName)
+	cleanupStreams(nc, streamName)
+	defer cleanupStreams(nc, streamName)
 
 	opts := &NATSJetStreamOptions{
 		Serialize:           &JSONSerialize{},
@@ -612,8 +612,8 @@ func TestNATSJetStreamEventBus_ParameterValidation(t *testing.T) {
 	defer nc.Close()
 
 	streamName := "TEST_PARAMS"
-	cleanupStreams(t, nc, streamName)
-	defer cleanupStreams(t, nc, streamName)
+	cleanupStreams(nc, streamName)
+	defer cleanupStreams(nc, streamName)
 
 	// 测试参数校验和默认值填充
 	opts := &NATSJetStreamOptions{
@@ -659,8 +659,8 @@ func TestNATSJetStreamEventBus_StreamNames(t *testing.T) {
 	defer nc.Close()
 
 	streamName := "MYAPP"
-	cleanupStreams(t, nc, streamName)
-	defer cleanupStreams(t, nc, streamName)
+	cleanupStreams(nc, streamName)
+	defer cleanupStreams(nc, streamName)
 
 	opts := &NATSJetStreamOptions{
 		Serialize:           &JSONSerialize{},
@@ -712,8 +712,8 @@ func TestNATSJetStreamEventBus_SubjectNames(t *testing.T) {
 	defer nc.Close()
 
 	streamName := "EVENTBUS"
-	cleanupStreams(t, nc, streamName)
-	defer cleanupStreams(t, nc, streamName)
+	cleanupStreams(nc, streamName)
+	defer cleanupStreams(nc, streamName)
 
 	opts := &NATSJetStreamOptions{
 		Serialize:           &JSONSerialize{},

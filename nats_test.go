@@ -51,8 +51,8 @@ func TestNATSEventBus(t *testing.T) {
 	// 验证消息接收
 	select {
 	case msg := <-received:
-		if msg.Value != testMessage {
-			t.Errorf("Expected %q, got %q", testMessage, msg.Value)
+		if string(msg.Value) != testMessage {
+			t.Errorf("Expected %q, got %q", testMessage, string(msg.Value))
 		}
 	case <-time.After(5 * time.Second):
 		t.Error("Timeout waiting for message")

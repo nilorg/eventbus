@@ -81,21 +81,19 @@ func (bus *redisEventBus) PublishAsync(ctx context.Context, topic string, v inte
 }
 
 func (bus *redisEventBus) publish(ctx context.Context, topic string, v interface{}, _ bool) (err error) {
-	var (
-		msg   *Message
-		msgOK bool
-	)
-	if v1, v1Ok := v.(*Message); v1Ok {
-		msg = v1
-		msgOK = true
-	} else if v2, v2Ok := v.(Message); v2Ok {
-		msg = &v2
-		msgOK = true
-	}
-	if !msgOK {
+	var msg *Message
+	
+	if m, ok := v.(*Message); ok {
+		msg = m
+	} else {
+		eventBytes, marshalErr := bus.options.Serialize.Marshal(v)
+		if marshalErr != nil {
+			return fmt.Errorf("stage 1 marshal event failed: %w", marshalErr)
+		}
+		
 		msg = &Message{
-			Header: make(MessageHeader),
-			Value:  v,
+			Header: extractHeaders(ctx, topic),
+			Value:  eventBytes,
 		}
 	}
 	// set message header
@@ -108,38 +106,36 @@ func (bus *redisEventBus) publish(ctx context.Context, topic string, v interface
 	}
 	// 自动添加 topic 到消息头
 	msg.Header["topic"] = topic
-	var msgHeader []byte
-	msgHeader, err = bus.options.Serialize.Marshal(msg.Header)
+	msgBytes, err := bus.options.Serialize.Marshal(msg)
 	if err != nil {
-		return
+		return fmt.Errorf("stage 2 marshal message failed: %w", err)
 	}
-	var msgValue []byte
-	msgValue, err = bus.options.Serialize.Marshal(msg.Value)
-	if err != nil {
-		return
-	}
-	bus.options.Logger.Debugf(ctx, "publish msg data: %s", string(msgValue))
+	bus.options.Logger.Debugf(ctx, "publish msg data: %s", string(msgBytes))
 
 	err = bus.conn.XAdd(ctx, &redis.XAddArgs{
 		Stream: topic,
 		Values: map[string]interface{}{
-			"header": string(msgHeader),
-			"value":  string(msgValue),
+			"message": string(msgBytes),
 		},
 	}).Err()
 	return
 }
 
-func (bus *redisEventBus) Subscribe(ctx context.Context, topic string, h SubscribeHandler) (err error) {
+func (bus *redisEventBus) Subscribe(ctx context.Context, topic string, h SubscribeHandler, opts ...SubscribeOption) (err error) {
 	return bus.subscribe(ctx, topic, h, false)
 }
 
-func (bus *redisEventBus) SubscribeAsync(ctx context.Context, topic string, h SubscribeHandler) (err error) {
+func (bus *redisEventBus) SubscribeAsync(ctx context.Context, topic string, h SubscribeHandler, opts ...SubscribeOption) (err error) {
 	return bus.subscribe(ctx, topic, h, true)
 }
 
-func (bus *redisEventBus) subscribe(ctx context.Context, topic string, h SubscribeHandler, async bool) (err error) {
-
+func (bus *redisEventBus) subscribe(ctx context.Context, topic string, h SubscribeHandler, async bool, opts ...SubscribeOption) (err error) {
+	options := &SubscribeOptions{
+		Converter: &AutoConverter{},
+	}
+	for _, opt := range opts {
+		opt(options)
+	}
 	queueName := fmt.Sprintf("%s.default.group.%s", topic, Version)
 	var consumer string
 	if gid, ok := FromGroupIDContext(ctx); ok {
@@ -151,13 +147,13 @@ func (bus *redisEventBus) subscribe(ctx context.Context, topic string, h Subscri
 	bus.conn.XGroupCreateMkStream(ctx, topic, queueName, "$")
 	if async {
 		go func(subCtx context.Context) {
-			if asyncErr := bus.xReadGroup(subCtx, topic, queueName, consumer, h); asyncErr != nil {
+			if asyncErr := bus.xReadGroup(subCtx, topic, queueName, consumer, h, options); asyncErr != nil {
 				bus.options.Logger.Errorf(subCtx, "async subscribe %s error: %v", topic, asyncErr)
 			}
 		}(ctx)
 		return
 	}
-	err = bus.xReadGroup(ctx, topic, queueName, consumer, h)
+	err = bus.xReadGroup(ctx, topic, queueName, consumer, h, options)
 	return
 }
 
@@ -221,7 +217,7 @@ func isRedisNoStreamError(err error) bool {
 		strings.Contains(msg, "key not found")
 }
 
-func (bus *redisEventBus) xReadGroup(ctx context.Context, stream, group, consumer string, h SubscribeHandler) (err error) {
+func (bus *redisEventBus) xReadGroup(ctx context.Context, stream, group, consumer string, h SubscribeHandler, options *SubscribeOptions) (err error) {
 	retryCount := 0
 	baseRetryInterval := bus.options.RetryInterval
 	if baseRetryInterval <= 0 {
@@ -276,9 +272,8 @@ func (bus *redisEventBus) xReadGroup(ctx context.Context, stream, group, consume
 				s := streams[i]
 				msgLen := len(s.Messages)
 				for j := 0; j < msgLen; j++ {
-					if err = bus.handleSubMessageWithRetry(ctx, s.Stream, group, s.Messages[j], h); err != nil {
+					if err = bus.handleSubMessageWithRetry(ctx, s.Stream, group, s.Messages[j], h, options); err != nil {
 						bus.options.Logger.Errorf(ctx, "message processing failed after retries: %v", err)
-						// 根据配置决定是否继续处理其他消息
 						if !bus.options.SkipBadMessages {
 							return err
 						}
@@ -289,26 +284,30 @@ func (bus *redisEventBus) xReadGroup(ctx context.Context, stream, group, consume
 	}
 }
 
-func (bus *redisEventBus) handleSubMessage(ctx context.Context, stream, group string, msg redis.XMessage, h SubscribeHandler) (err error) {
-	msgHeader, msgHeaderOK := msg.Values["header"]
-	if !msgHeaderOK {
+func (bus *redisEventBus) handleSubMessage(ctx context.Context, stream, group string, msg redis.XMessage, h SubscribeHandler, options *SubscribeOptions) (err error) {
+	msgData, msgDataOK := msg.Values["message"]
+	if !msgDataOK {
 		return
 	}
-	msgValue, msgValueOK := msg.Values["value"]
-	if !msgValueOK {
-		return
+
+	bus.options.Logger.Debugf(ctx, "subscribe msg data: %s", msgData)
+
+	msgBytes := []byte(msgData.(string))
+	contentType := bus.options.Serialize.ContentType()
+
+	convertedMsg, convertErr := options.Converter.Convert(msgBytes, contentType)
+	if convertErr != nil {
+		bus.options.Logger.Errorf(ctx, "failed to convert message: %v", convertErr)
+		if bus.options.SkipBadMessages {
+			if ackErr := bus.conn.XAck(ctx, stream, group, msg.ID).Err(); ackErr != nil {
+				bus.options.Logger.Errorf(ctx, "failed to ack bad message: %v", ackErr)
+			}
+			return nil
+		}
+		return convertErr
 	}
-	m := Message{
-		Header: make(MessageHeader),
-	}
-	if err = bus.options.Serialize.Unmarshal([]byte(msgHeader.(string)), &m.Header); err != nil {
-		return
-	}
-	bus.options.Logger.Debugf(ctx, "subscribe msg data: %s", msgValue)
-	if err = bus.options.Serialize.Unmarshal([]byte(msgValue.(string)), &m.Value); err != nil {
-		return
-	}
-	if err = h(ctx, &m); err == nil {
+
+	if err = h(ctx, convertedMsg); err == nil {
 		err = bus.conn.XAck(ctx, stream, group, msg.ID).Err()
 	}
 	return
@@ -362,131 +361,65 @@ func (bus *redisEventBus) calculateBackoff(baseInterval time.Duration, retryCoun
 }
 
 // handleSubMessageWithRetry 带重试的消息处理
-func (bus *redisEventBus) handleSubMessageWithRetry(ctx context.Context, stream, group string, msg redis.XMessage, h SubscribeHandler) (err error) {
+func (bus *redisEventBus) handleSubMessageWithRetry(ctx context.Context, stream, group string, msg redis.XMessage, h SubscribeHandler, options *SubscribeOptions) (err error) {
 	maxRetries := bus.options.MessageMaxRetries
 	if maxRetries <= 0 {
-		maxRetries = 1 // 至少尝试一次
+		maxRetries = 2
+	}
+
+	retryCount := 0
+	baseInterval := bus.options.RetryInterval
+	if baseInterval <= 0 {
+		baseInterval = time.Second
 	}
 
 	for attempt := 0; attempt <= maxRetries; attempt++ {
-		err = bus.handleSubMessage(ctx, stream, group, msg, h)
-		if err == nil {
-			// 处理成功，返回
-			return nil
-		}
+		if attempt > 0 {
+			retryInterval := bus.calculateBackoff(baseInterval, retryCount)
+			bus.options.Logger.Warnf(ctx, "Retrying message processing (attempt %d/%d) after %v",
+				attempt, maxRetries+1, retryInterval)
 
-		// 记录重试信息
-		if attempt < maxRetries {
-			bus.options.Logger.Warnf(ctx, "message processing failed (attempt %d/%d), retrying: %v",
-				attempt+1, maxRetries+1, err)
-
-			// 短暂等待后重试
 			select {
 			case <-ctx.Done():
 				return ctx.Err()
-			case <-time.After(time.Millisecond * 100): // 100ms 重试间隔
-				continue
+			case <-time.After(retryInterval):
 			}
 		}
+
+		err = bus.handleSubMessage(ctx, stream, group, msg, h, options)
+		if err == nil {
+			return nil
+		}
+
+		retryCount++
+		bus.options.Logger.Errorf(ctx, "Message processing failed (attempt %d/%d): %v",
+			attempt+1, maxRetries+1, err)
 	}
 
-	// 所有重试都失败了
-	bus.options.Logger.Errorf(ctx, "message processing failed after %d attempts: %v", maxRetries+1, err)
-
-	// 如果配置了死信队列，将消息发送到死信队列
+	// 如果所有重试都失败，发送到死信队列
 	if bus.options.DeadLetterTopic != "" {
-		if dlErr := bus.sendToDeadLetter(ctx, stream, msg); dlErr != nil {
-			bus.options.Logger.Errorf(ctx, "failed to send message to dead letter queue: %v", dlErr)
+		bus.options.Logger.Errorf(ctx, "Message processing failed after %d attempts, sending to dead letter queue", maxRetries+1)
+		
+		// 先尝试将原始消息发送到死信队列
+		originalMsg := &Message{
+			Header: make(map[string]string),
+			Value:  []byte(fmt.Sprintf("%v", msg.Values)),
+		}
+		originalMsg.Header["topic"] = stream
+		originalMsg.Header["message_id"] = msg.ID
+		
+		dlqMsg := CreateDeadLetterMessage(stream, originalMsg, err.Error(), bus.options.DeadLetterTopic, "redis", bus.options.Serialize)
+		if dlqErr := bus.Publish(ctx, bus.options.DeadLetterTopic, dlqMsg); dlqErr != nil {
+			bus.options.Logger.Errorf(ctx, "Failed to send to dead letter queue: %v", dlqErr)
+			// 死信队列发送失败，记录日志但继续处理（避免阻塞）
 		} else {
-			bus.options.Logger.Infof(ctx, "message sent to dead letter queue: %s", msg.ID)
-			// 发送到死信队列成功，确认原消息
+			// 死信队列发送成功，确认原始消息
 			if ackErr := bus.conn.XAck(ctx, stream, group, msg.ID).Err(); ackErr != nil {
-				bus.options.Logger.Errorf(ctx, "failed to ack message after sending to DLQ: %v", ackErr)
+				bus.options.Logger.Errorf(ctx, "Failed to ack message after dead letter: %v", ackErr)
 			}
-			return nil // 不返回错误，因为消息已经处理（发送到DLQ）
 		}
 	}
 
 	return err
 }
 
-// sendToDeadLetter 发送消息到死信队列
-func (bus *redisEventBus) sendToDeadLetter(ctx context.Context, originalTopic string, msg redis.XMessage) error {
-	if bus.options.DeadLetterTopic == "" {
-		return fmt.Errorf("dead letter topic not configured")
-	}
-
-	// 将Redis消息转换为EventBus消息格式
-	originalMsg := &Message{
-		Header: MessageHeader{
-			"message_id": msg.ID,
-			"topic":      originalTopic,
-		},
-		Value: msg.Values,
-	}
-
-	// 尝试从消息值中提取原始的header和value
-	if headerData, headerOK := msg.Values["header"]; headerOK {
-		if headerStr, isString := headerData.(string); isString {
-			var header MessageHeader
-			if err := bus.options.Serialize.Unmarshal([]byte(headerStr), &header); err == nil {
-				// 成功解析header，合并到消息中
-				for k, v := range header {
-					originalMsg.Header[k] = v
-				}
-			}
-		}
-	}
-
-	if valueData, valueOK := msg.Values["value"]; valueOK {
-		if valueStr, isString := valueData.(string); isString {
-			var value interface{}
-			if err := bus.options.Serialize.Unmarshal([]byte(valueStr), &value); err == nil {
-				originalMsg.Value = value
-			}
-		}
-	}
-
-	// 使用统一的死信消息创建函数
-	dlqMsg := CreateDeadLetterMessage(originalTopic, originalMsg, "message processing failed after retries", bus.options.DeadLetterTopic, "redis")
-
-	// 将死信消息序列化为JSON字符串，然后作为单个值存储
-	dlqData, err := bus.options.Serialize.Marshal(dlqMsg)
-	if err != nil {
-		bus.options.Logger.Errorf(ctx, "failed to marshal dead letter message: %v", err)
-		return err
-	}
-
-	// 使用统一的格式存储死信消息，并设置长度限制
-	dlqValues := map[string]interface{}{
-		"dead_letter_message": string(dlqData),
-		"timestamp":           time.Now().Unix(),
-		"source":              "redis-stream",
-	}
-
-	addArgs := &redis.XAddArgs{
-		Stream: bus.options.DeadLetterTopic,
-		Values: dlqValues,
-	}
-
-	// 设置死信队列最大长度
-	if bus.options.DeadLetterMaxLen > 0 {
-		addArgs.MaxLen = bus.options.DeadLetterMaxLen
-		addArgs.Approx = true // 使用近似修剪提高性能
-	}
-
-	if err := bus.conn.XAdd(ctx, addArgs).Err(); err != nil {
-		bus.options.Logger.Errorf(ctx, "failed to send message to dead letter stream: %v", err)
-		return err
-	}
-
-	// 如果配置了TTL，设置过期时间
-	if bus.options.DeadLetterTTL > 0 {
-		if err := bus.conn.Expire(ctx, bus.options.DeadLetterTopic, bus.options.DeadLetterTTL).Err(); err != nil {
-			bus.options.Logger.Warnf(ctx, "failed to set TTL for dead letter stream: %v", err)
-		}
-	}
-
-	bus.options.Logger.Infof(ctx, "message sent to dead letter stream %s", bus.options.DeadLetterTopic)
-	return nil
-}

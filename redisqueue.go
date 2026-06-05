@@ -80,91 +80,50 @@ func (bus *redisQueueEventBus) Publish(ctx context.Context, topic string, v inte
 func (bus *redisQueueEventBus) PublishAsync(ctx context.Context, topic string, v interface{}) (err error) {
 	return bus.publish(ctx, topic, v, true)
 }
-
 func (bus *redisQueueEventBus) publish(ctx context.Context, topic string, v interface{}, async bool) (err error) {
-	var (
-		msg   *Message
-		msgOK bool
-	)
-	if v1, v1Ok := v.(*Message); v1Ok {
-		msg = v1
-		msgOK = true
-	} else if v2, v2Ok := v.(Message); v2Ok {
-		msg = &v2
-		msgOK = true
-	}
-	if !msgOK {
+	var msg *Message
+	
+	if m, ok := v.(*Message); ok {
+		msg = m
+	} else {
+		eventBytes, marshalErr := bus.options.Serialize.Marshal(v)
+		if marshalErr != nil {
+			return fmt.Errorf("stage 1 marshal event failed: %w", marshalErr)
+		}
+		
 		msg = &Message{
-			Header: make(MessageHeader),
-			Value:  v,
+			Header: extractHeaders(ctx, topic),
+			Value:  eventBytes,
 		}
 	}
 
-	// set message header
-	if f, ok := FromSetMessageHeaderContext(ctx); ok {
-		if headers := f(ctx); headers != nil {
-			for key, value := range headers {
-				msg.Header[key] = value
+	msgBytes, err := bus.options.Serialize.Marshal(msg)
+	if err != nil {
+		return fmt.Errorf("stage 2 marshal message failed: %w", err)
+	}
+	bus.options.Logger.Debugf(ctx, "publish msg data: %s", string(msgBytes))
+
+	if async {
+		go func() {
+			if asyncErr := bus.conn.RPush(ctx, topic, msgBytes).Err(); asyncErr != nil {
+				bus.options.Logger.Errorf(ctx, "async publish error: %v", asyncErr)
 			}
-		}
-	}
-	// 自动添加 topic 到消息头
-	msg.Header["topic"] = topic
-
-	var msgHeader []byte
-	msgHeader, err = bus.options.Serialize.Marshal(msg.Header)
-	if err != nil {
-		return
-	}
-	var msgValue []byte
-	msgValue, err = bus.options.Serialize.Marshal(msg.Value)
-	if err != nil {
-		return
-	}
-
-	bus.options.Logger.Debugf(ctx, "publish queue msg data: %s", string(msgValue))
-
-	// 构建队列消息，使用与redis.go相同的格式
-	queueMsg := map[string]interface{}{
-		"header": string(msgHeader),
-		"value":  string(msgValue),
-	}
-	var queueMsgData []byte
-	queueMsgData, err = bus.options.Serialize.Marshal(queueMsg)
-	if err != nil {
-		return
-	}
-
-	push := func(targetQueue string) error {
-		if err := bus.conn.LPush(ctx, targetQueue, string(queueMsgData)).Err(); err != nil {
-			bus.options.Logger.Errorf(ctx, "publish to queue %s error: %v", targetQueue, err)
-			return err
-		}
+		}()
 		return nil
 	}
 
-	if async {
-		go func(queue string) {
-			if asyncErr := push(queue); asyncErr != nil {
-				bus.options.Logger.Errorf(ctx, "async publish error: %v", asyncErr)
-			}
-		}(topic)
-		return
-	}
-
-	err = push(topic)
-	return
+	return bus.conn.RPush(ctx, topic, msgBytes).Err()
 }
 
-func (bus *redisQueueEventBus) Subscribe(ctx context.Context, topic string, h SubscribeHandler) (err error) {
+func (bus *redisQueueEventBus) Subscribe(ctx context.Context, topic string, h SubscribeHandler, opts ...SubscribeOption) (err error) {
 	return bus.subscribe(ctx, topic, h, false)
 }
 
-func (bus *redisQueueEventBus) SubscribeAsync(ctx context.Context, topic string, h SubscribeHandler) (err error) {
+func (bus *redisQueueEventBus) SubscribeAsync(ctx context.Context, topic string, h SubscribeHandler, opts ...SubscribeOption) (err error) {
 	return bus.subscribe(ctx, topic, h, true)
 }
 
-func (bus *redisQueueEventBus) subscribe(ctx context.Context, topic string, h SubscribeHandler, async bool) (err error) {
+func (bus *redisQueueEventBus) subscribe(ctx context.Context, topic string, h SubscribeHandler, async bool, opts ...SubscribeOption) (err error) {
 	queueName := topic
 
 	if async {
@@ -243,32 +202,13 @@ func (bus *redisQueueEventBus) consumeQueue(ctx context.Context, queueName strin
 }
 
 func (bus *redisQueueEventBus) handleQueueMessage(ctx context.Context, msgData string, h SubscribeHandler) (err error) {
-	// 解析队列消息，格式与redis.go保持一致
-	var queueMsg map[string]interface{}
-	if err = bus.options.Serialize.Unmarshal([]byte(msgData), &queueMsg); err != nil {
-		return
+	// 直接反序列化为Message对象
+	var m Message
+	if err = bus.options.Serialize.Unmarshal([]byte(msgData), &m); err != nil {
+		return fmt.Errorf("unmarshal message failed: %w", err)
 	}
 
-	msgHeader, msgHeaderOK := queueMsg["header"]
-	if !msgHeaderOK {
-		return fmt.Errorf("message header not found")
-	}
-	msgValue, msgValueOK := queueMsg["value"]
-	if !msgValueOK {
-		return fmt.Errorf("message value not found")
-	}
-
-	m := Message{
-		Header: make(MessageHeader),
-	}
-	if err = bus.options.Serialize.Unmarshal([]byte(msgHeader.(string)), &m.Header); err != nil {
-		return
-	}
-
-	bus.options.Logger.Debugf(ctx, "subscribe queue msg data: %s", msgValue)
-	if err = bus.options.Serialize.Unmarshal([]byte(msgValue.(string)), &m.Value); err != nil {
-		return
-	}
+	bus.options.Logger.Debugf(ctx, "subscribe queue msg data: %s", string(m.Value))
 
 	// 调用处理器
 	err = h(ctx, &m)
@@ -429,26 +369,43 @@ func (bus *redisQueueEventBus) sendToDeadLetterQueue(ctx context.Context, origin
 			}
 
 			// 解析value
-			if err := bus.options.Serialize.Unmarshal([]byte(value.(string)), &originalMsg.Value); err != nil {
-				bus.options.Logger.Warnf(ctx, "failed to unmarshal value for dead letter: %v", err)
-				originalMsg.Value = value
+			var valueBytes []byte
+			switch v := value.(type) {
+			case string:
+				valueBytes = []byte(v)
+			case []byte:
+				valueBytes = v
+			default:
+				if data, marshalErr := bus.options.Serialize.Marshal(v); marshalErr == nil {
+					valueBytes = data
+				} else {
+					valueBytes = []byte(fmt.Sprintf("%v", v))
+				}
 			}
+			originalMsg.Value = valueBytes
 		}
 	}
 
 	// 如果无法解析为Message格式，创建简单的消息
 	if originalMsg == nil {
+		// 将原始消息序列化为bytes
+		var rawData []byte
+		if data, marshalErr := bus.options.Serialize.Marshal(queueMsg); marshalErr == nil {
+			rawData = data
+		} else {
+			rawData = []byte(msgData)
+		}
 		originalMsg = &Message{
 			Header: MessageHeader{
 				"topic":    originalQueue,
 				"raw_data": "true",
 			},
-			Value: queueMsg,
+			Value: rawData,
 		}
 	}
 
 	// 使用统一的死信消息创建函数
-	dlqMsg := CreateDeadLetterMessage(originalQueue, originalMsg, "message processing failed after retries", bus.options.DeadLetterTopic, "redis-queue")
+	dlqMsg := CreateDeadLetterMessage(originalQueue, originalMsg, "message processing failed after retries", bus.options.DeadLetterTopic, "redis-queue", bus.options.Serialize)
 
 	// 序列化死信消息
 	var dlqMsgData []byte
