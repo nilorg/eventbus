@@ -435,12 +435,12 @@ func (n *natsJetStreamEventBus) sendToDeadLetter(ctx context.Context, originalTo
 
 // Subscribe 订阅消息（同步）
 func (n *natsJetStreamEventBus) Subscribe(ctx context.Context, topic string, h SubscribeHandler, opts ...SubscribeOption) error {
-	return n.subscribe(ctx, topic, h, false)
+	return n.subscribe(ctx, topic, h, false, opts...)
 }
 
 // SubscribeAsync 订阅消息（异步）
 func (n *natsJetStreamEventBus) SubscribeAsync(ctx context.Context, topic string, h SubscribeHandler, opts ...SubscribeOption) error {
-	return n.subscribe(ctx, topic, h, true)
+	return n.subscribe(ctx, topic, h, true, opts...)
 }
 
 // subscribe 内部订阅实现
@@ -449,9 +449,7 @@ func (n *natsJetStreamEventBus) SubscribeAsync(ctx context.Context, topic string
 // - Broadcast: Group 作为实例标识，每个 Group 创建独立的 Consumer，所有订阅者都收到消息
 // - Limits: Group 可选用于负载均衡，支持历史消息回溯
 func (n *natsJetStreamEventBus) subscribe(ctx context.Context, topic string, h SubscribeHandler, isAsync bool, opts ...SubscribeOption) error {
-	options := &SubscribeOptions{
-		Converter: &AutoConverter{},
-	}
+	options := &SubscribeOptions{}
 	for _, opt := range opts {
 		opt(options)
 	}
@@ -601,15 +599,16 @@ func (n *natsJetStreamEventBus) pullMessages(ctx context.Context, sub *nats.Subs
 
 // processMessage 处理接收到的消息
 func (n *natsJetStreamEventBus) processMessage(ctx context.Context, natsMsg *nats.Msg, h SubscribeHandler, topic string, options *SubscribeOptions) {
-	contentType := ""
-	if natsMsg.Header != nil {
-		contentType = natsMsg.Header.Get("Content-Type")
-	}
-	if contentType == "" {
-		contentType = n.options.Serialize.ContentType()
+	var msg *Message
+	var err error
+
+	if options.Converter == nil {
+		msg = &Message{}
+		err = n.options.Serialize.Unmarshal(natsMsg.Data, msg)
+	} else {
+		msg, err = options.Converter.Convert(natsMsg.Data)
 	}
 
-	msg, err := options.Converter.Convert(natsMsg.Data, contentType)
 	if err != nil {
 		n.options.Logger.Errorf(ctx, "Failed to convert message from topic %s: %v", topic, err)
 		if n.options.SkipBadMessages {

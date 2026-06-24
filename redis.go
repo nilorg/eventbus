@@ -122,17 +122,15 @@ func (bus *redisEventBus) publish(ctx context.Context, topic string, v interface
 }
 
 func (bus *redisEventBus) Subscribe(ctx context.Context, topic string, h SubscribeHandler, opts ...SubscribeOption) (err error) {
-	return bus.subscribe(ctx, topic, h, false)
+	return bus.subscribe(ctx, topic, h, false, opts...)
 }
 
 func (bus *redisEventBus) SubscribeAsync(ctx context.Context, topic string, h SubscribeHandler, opts ...SubscribeOption) (err error) {
-	return bus.subscribe(ctx, topic, h, true)
+	return bus.subscribe(ctx, topic, h, true, opts...)
 }
 
 func (bus *redisEventBus) subscribe(ctx context.Context, topic string, h SubscribeHandler, async bool, opts ...SubscribeOption) (err error) {
-	options := &SubscribeOptions{
-		Converter: &AutoConverter{},
-	}
+	options := &SubscribeOptions{}
 	for _, opt := range opts {
 		opt(options)
 	}
@@ -293,9 +291,17 @@ func (bus *redisEventBus) handleSubMessage(ctx context.Context, stream, group st
 	bus.options.Logger.Debugf(ctx, "subscribe msg data: %s", msgData)
 
 	msgBytes := []byte(msgData.(string))
-	contentType := bus.options.Serialize.ContentType()
 
-	convertedMsg, convertErr := options.Converter.Convert(msgBytes, contentType)
+	var convertedMsg *Message
+	var convertErr error
+
+	if options.Converter == nil {
+		convertedMsg = &Message{}
+		convertErr = bus.options.Serialize.Unmarshal(msgBytes, convertedMsg)
+	} else {
+		convertedMsg, convertErr = options.Converter.Convert(msgBytes)
+	}
+
 	if convertErr != nil {
 		bus.options.Logger.Errorf(ctx, "failed to convert message: %v", convertErr)
 		if bus.options.SkipBadMessages {

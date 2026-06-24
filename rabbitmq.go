@@ -389,9 +389,7 @@ func (bus *rabbitMQEventBus) SubscribeAsync(ctx context.Context, topic string, h
 }
 
 func (bus *rabbitMQEventBus) subscribe(ctx context.Context, topic string, h SubscribeHandler, async bool, opts ...SubscribeOption) (err error) {
-	options := &SubscribeOptions{
-		Converter: &AutoConverter{},
-	}
+	options := &SubscribeOptions{}
 	for _, opt := range opts {
 		opt(options)
 	}
@@ -467,12 +465,16 @@ func (bus *rabbitMQEventBus) handleSubMessage(ctx context.Context, msgs <-chan a
 
 			bus.options.Logger.Debugf(ctx, "subscribe msg data: %s", string(msg.Body))
 
-			contentType := msg.ContentType
-			if contentType == "" {
-				contentType = bus.options.Serialize.ContentType()
+			var convertedMsg *Message
+			var convertErr error
+
+			if options.Converter == nil {
+				convertedMsg = &Message{}
+				convertErr = bus.options.Serialize.Unmarshal(msg.Body, convertedMsg)
+			} else {
+				convertedMsg, convertErr = options.Converter.Convert(msg.Body)
 			}
 
-			convertedMsg, convertErr := options.Converter.Convert(msg.Body, contentType)
 			if convertErr != nil {
 				bus.options.Logger.Errorf(ctx, "failed to convert message: %v", convertErr)
 				if bus.options.SkipBadMessages {

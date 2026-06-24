@@ -2,22 +2,15 @@ package eventbus
 
 import (
 	"encoding/json"
-
-	"github.com/vmihailenco/msgpack/v5"
-	"google.golang.org/protobuf/proto"
 )
 
 type MessageConverter interface {
-	Convert(data []byte, contentType string) (*Message, error)
+	Convert(data []byte) (*Message, error)
 }
 
 type JSONConverter struct{}
 
-func (c *JSONConverter) Convert(data []byte, contentType string) (*Message, error) {
-	if contentType != "application/json" {
-		return nil, ErrUnsupportedContentType
-	}
-
+func (c *JSONConverter) Convert(data []byte) (*Message, error) {
 	var legacyMsg struct {
 		Header map[string]string `json:"header"`
 		Value  interface{}       `json:"value"`
@@ -37,31 +30,32 @@ func (c *JSONConverter) Convert(data []byte, contentType string) (*Message, erro
 	}, nil
 }
 
-type AutoConverter struct{}
+type AutoConverter struct {
+	serializers map[string]Serializer
+}
 
-func (c *AutoConverter) Convert(data []byte, contentType string) (*Message, error) {
-	switch contentType {
-	case "application/json":
+func NewAutoConverter() *AutoConverter {
+	return &AutoConverter{
+		serializers: map[string]Serializer{
+			"application/json":       &JSONSerialize{},
+			"application/x-protobuf": &ProtobufSerialize{},
+			"application/x-msgpack":  &MessagePackSerialize{},
+		},
+	}
+}
+
+func (c *AutoConverter) Register(contentType string, serializer Serializer) {
+	c.serializers[contentType] = serializer
+}
+
+func (c *AutoConverter) Convert(data []byte) (*Message, error) {
+	for _, serializer := range c.serializers {
 		var msg Message
-		if err := json.Unmarshal(data, &msg); err == nil {
+		if err := serializer.Unmarshal(data, &msg); err == nil {
 			return &msg, nil
 		}
-		return (&JSONConverter{}).Convert(data, contentType)
-	case "application/x-protobuf":
-		var msg Message
-		if err := proto.Unmarshal(data, &msg); err != nil {
-			return nil, err
-		}
-		return &msg, nil
-	case "application/x-msgpack":
-		var msg Message
-		if err := msgpack.Unmarshal(data, &msg); err != nil {
-			return nil, err
-		}
-		return &msg, nil
-	default:
-		return nil, ErrUnsupportedContentType
 	}
+	return nil, ErrUnsupportedContentType
 }
 
 type SubscribeOptions struct {

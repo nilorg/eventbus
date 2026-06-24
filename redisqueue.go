@@ -116,30 +116,35 @@ func (bus *redisQueueEventBus) publish(ctx context.Context, topic string, v inte
 }
 
 func (bus *redisQueueEventBus) Subscribe(ctx context.Context, topic string, h SubscribeHandler, opts ...SubscribeOption) (err error) {
-	return bus.subscribe(ctx, topic, h, false)
+	return bus.subscribe(ctx, topic, h, false, opts...)
 }
 
 func (bus *redisQueueEventBus) SubscribeAsync(ctx context.Context, topic string, h SubscribeHandler, opts ...SubscribeOption) (err error) {
-	return bus.subscribe(ctx, topic, h, true)
+	return bus.subscribe(ctx, topic, h, true, opts...)
 }
 
 func (bus *redisQueueEventBus) subscribe(ctx context.Context, topic string, h SubscribeHandler, async bool, opts ...SubscribeOption) (err error) {
+	options := &SubscribeOptions{}
+	for _, opt := range opts {
+		opt(options)
+	}
+
 	queueName := topic
 
 	if async {
 		go func(subCtx context.Context) {
-			if asyncErr := bus.consumeQueue(subCtx, queueName, h); asyncErr != nil {
+			if asyncErr := bus.consumeQueue(subCtx, queueName, h, options); asyncErr != nil {
 				bus.options.Logger.Errorf(subCtx, "async subscribe queue %s error: %v", queueName, asyncErr)
 			}
 		}(ctx)
 		return
 	}
 
-	err = bus.consumeQueue(ctx, queueName, h)
+	err = bus.consumeQueue(ctx, queueName, h, options)
 	return
 }
 
-func (bus *redisQueueEventBus) consumeQueue(ctx context.Context, queueName string, h SubscribeHandler) (err error) {
+func (bus *redisQueueEventBus) consumeQueue(ctx context.Context, queueName string, h SubscribeHandler, options *SubscribeOptions) (err error) {
 	retryCount := 0
 	baseRetryInterval := bus.options.RetryInterval
 	if baseRetryInterval <= 0 {
@@ -190,7 +195,7 @@ func (bus *redisQueueEventBus) consumeQueue(ctx context.Context, queueName strin
 			}
 
 			msgData := result[1]
-			if err = bus.handleQueueMessageWithRetry(ctx, queueName, msgData, h); err != nil {
+			if err = bus.handleQueueMessageWithRetry(ctx, queueName, msgData, h, options); err != nil {
 				bus.options.Logger.Errorf(ctx, "message processing failed after retries: %v", err)
 				// 根据配置决定是否继续处理其他消息
 				if !bus.options.SkipBadMessages {
@@ -201,17 +206,26 @@ func (bus *redisQueueEventBus) consumeQueue(ctx context.Context, queueName strin
 	}
 }
 
-func (bus *redisQueueEventBus) handleQueueMessage(ctx context.Context, msgData string, h SubscribeHandler) (err error) {
-	// 直接反序列化为Message对象
-	var m Message
-	if err = bus.options.Serialize.Unmarshal([]byte(msgData), &m); err != nil {
-		return fmt.Errorf("unmarshal message failed: %w", err)
+func (bus *redisQueueEventBus) handleQueueMessage(ctx context.Context, msgData string, h SubscribeHandler, options *SubscribeOptions) (err error) {
+	msgBytes := []byte(msgData)
+
+	var m *Message
+
+	if options.Converter == nil {
+		m = &Message{}
+		err = bus.options.Serialize.Unmarshal(msgBytes, m)
+	} else {
+		m, err = options.Converter.Convert(msgBytes)
+	}
+
+	if err != nil {
+		return fmt.Errorf("convert message failed: %w", err)
 	}
 
 	bus.options.Logger.Debugf(ctx, "subscribe queue msg data: %s", string(m.Value))
 
 	// 调用处理器
-	err = h(ctx, &m)
+	err = h(ctx, m)
 	return
 }
 
@@ -294,14 +308,14 @@ func (bus *redisQueueEventBus) calculateBackoff(baseInterval time.Duration, retr
 }
 
 // handleQueueMessageWithRetry 带重试的消息处理
-func (bus *redisQueueEventBus) handleQueueMessageWithRetry(ctx context.Context, queueName, msgData string, h SubscribeHandler) (err error) {
+func (bus *redisQueueEventBus) handleQueueMessageWithRetry(ctx context.Context, queueName, msgData string, h SubscribeHandler, options *SubscribeOptions) (err error) {
 	maxRetries := bus.options.MessageMaxRetries
 	if maxRetries <= 0 {
 		maxRetries = 1 // 至少尝试一次
 	}
 
 	for attempt := 0; attempt <= maxRetries; attempt++ {
-		err = bus.handleQueueMessage(ctx, msgData, h)
+		err = bus.handleQueueMessage(ctx, msgData, h, options)
 		if err == nil {
 			// 处理成功，返回
 			return nil

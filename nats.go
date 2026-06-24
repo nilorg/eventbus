@@ -179,9 +179,7 @@ func (n *natsEventBus) SubscribeAsync(ctx context.Context, topic string, h Subsc
 }
 
 func (n *natsEventBus) subscribe(ctx context.Context, topic string, h SubscribeHandler, isAsync bool, opts ...SubscribeOption) error {
-	options := &SubscribeOptions{
-		Converter: &AutoConverter{},
-	}
+	options := &SubscribeOptions{}
 	for _, opt := range opts {
 		opt(options)
 	}
@@ -228,15 +226,16 @@ func (n *natsEventBus) subscribe(ctx context.Context, topic string, h SubscribeH
 
 // processMessage 处理接收到的消息
 func (n *natsEventBus) processMessage(ctx context.Context, natsMsg *nats.Msg, h SubscribeHandler, topic string, options *SubscribeOptions) {
-	contentType := ""
-	if natsMsg.Header != nil {
-		contentType = natsMsg.Header.Get("Content-Type")
-	}
-	if contentType == "" {
-		contentType = n.options.Serialize.ContentType()
+	var msg *Message
+	var err error
+
+	if options.Converter == nil {
+		msg = &Message{}
+		err = n.options.Serialize.Unmarshal(natsMsg.Data, msg)
+	} else {
+		msg, err = options.Converter.Convert(natsMsg.Data)
 	}
 
-	msg, err := options.Converter.Convert(natsMsg.Data, contentType)
 	if err != nil {
 		n.options.Logger.Errorf(ctx, "Failed to convert message from topic %s: %v", topic, err)
 		if n.options.SkipBadMessages {
